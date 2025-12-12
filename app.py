@@ -2,13 +2,10 @@
 # Ophthalmology SRMA Prototype (Streamlit app.py)
 # - PICO 可留空，支援 NOT 排除關鍵字
 # - 多資料庫：PubMed / CrossRef / ClinicalTrials.gov
-# - 自動把 P/I/C/O/extra 轉成 (term[tiab] OR "term"[MeSH Terms])
-# - 統一欄位：pmid(主鍵) / doi / title / abstract / year / first_author / source / url
-# - AI rule-based 初篩 (Include / Exclude / Unsure + 理由 + 信心度)
-# - Title/Abstract screening：expander 卡片 + radio 按鈕
-# - Full-text decision + reason + 可貼上全文
-# - PRISMA 簡化數字（只看當次搜尋）＋ Unsure 清單
-# - 匯出：screening summary / Excluded / Unsure / data extraction template
+# - AI rule-based 初篩 + Covidence 風格介面
+# - PRISMA 簡化數字 + 匯出
+# - Step 6：互動式 Data extraction（Effect measure 下拉＋手動填 effect / CI）＋森林圖（fixed effect）
+# - 入口驗證：Email + 通行碼
 # =========================================================
 
 import streamlit as st
@@ -18,10 +15,20 @@ from xml.etree import ElementTree as ET
 from typing import Dict, List
 import re
 import html
+import math
 
-# --------------------- Streamlit 設定與 CSS ---------------------
+# Altair 用來畫森林圖（如果沒有安裝，也不會讓整個 app 掛掉）
+try:
+    import altair as alt
+    HAS_ALTAIR = True
+except ImportError:
+    HAS_ALTAIR = False
+
+# --------------------- Streamlit 設定 ---------------------
 st.set_page_config(page_title="Ophthalmology SRMA Prototype", layout="wide")
 
+
+# --------------------- CSS ---------------------
 CARD_CSS = """
 <style>
 .card {
@@ -125,7 +132,7 @@ def task_1_pico_input():
         max_value=10000,
         value=500,
         step=50,
-        help="PubMed / CrossRef / ClinicalTrials.gov 各自的抓取上限。API 與記憶體實務上仍會有限制，建議超過 2000 就先 refine 搜尋式或分批處理。",
+        help="PubMed / CrossRef / ClinicalTrials.gov 各自的抓取上限。建議超過 2000 就先 refine 搜尋式或分批處理。",
     )
 
     st.subheader("自動產生的 PubMed Query（已含 MeSH 同步，可手動微調）")
@@ -514,7 +521,7 @@ def run_ai_for_all(df: pd.DataFrame, pico: Dict):
 # Step 3. Covidence 風格 screening（expander + radio）
 # =========================================================
 def task_3_screening_ui(df: pd.DataFrame):
-    st.header("Step 3. Title / Abstract screening（Covidence 風格 + AI 初篩）")
+    st.header("Step 3. Title / Abstract screening")
 
     if "decisions" not in st.session_state:
         st.session_state.decisions = {}
@@ -623,11 +630,13 @@ def task_3_screening_ui(df: pd.DataFrame):
         if filter_mode == "目前標記為 Include 的" and human_decision != "Include":
             continue
 
-        exp_label = f"{title}"
-        with st.expander(exp_label):
+        with st.expander(title):
             st.markdown('<div class="card">', unsafe_allow_html=True)
 
-            meta_line = f"PMID/ID: {pmid} &nbsp;&nbsp;&nbsp; Year: {year} &nbsp;&nbsp;&nbsp; First author: {first_author} &nbsp;&nbsp;&nbsp; Source: {source}"
+            meta_line = (
+                f"PMID/ID: {pmid} &nbsp;&nbsp;&nbsp; Year: {year} &nbsp;&nbsp;&nbsp; "
+                f"First author: {first_author} &nbsp;&nbsp;&nbsp; Source: {source}"
+            )
             if doi:
                 meta_line += f" &nbsp;&nbsp;&nbsp; DOI: {doi}"
             st.markdown(meta_line, unsafe_allow_html=True)
@@ -706,7 +715,7 @@ def task_3_screening_ui(df: pd.DataFrame):
 # =========================================================
 # Step 4. PRISMA（只算本次搜尋）＋ Unsure 清單
 # =========================================================
-def task_6_prisma_summary(df: pd.DataFrame):
+def task_4_prisma_summary(df: pd.DataFrame):
     st.header("Step 4. 簡化版 PRISMA 數字")
 
     current_pmids = set(df["pmid"])
@@ -744,12 +753,9 @@ def task_6_prisma_summary(df: pd.DataFrame):
     st.write(f"Included in meta-analysis（full-text 決策）：**{len(include_ft_pmids)}**")
     st.write(f"Excluded after full-text：**{len(exclude_ft_pmids)}**")
 
-    # 避免沒有 source 欄位造成 KeyError（舊 session 或自訂 df）
     if "source" in df.columns:
         st.caption("依來源分布：")
         st.write(df["source"].value_counts())
-    else:
-        st.caption("目前的資料表沒有 'source' 欄位（可能是舊版 session），略過來源分布。")
 
     if unsure_ta_pmids:
         st.subheader("目前 Unsure（title/abstract）清單")
@@ -772,17 +778,10 @@ def task_6_prisma_summary(df: pd.DataFrame):
 
 
 # =========================================================
-# Step 5. 匯出：screening summary / excluded / unsure / data extraction
+# 共用：建 screening summary DataFrame（給 Step 5 / Step 6 用）
 # =========================================================
-def task_5_export_tables(df: pd.DataFrame, pico: Dict):
-    st.header("Step 5. 匯出清單（含 PICO & 資料萃取表）")
-
-    if "ai_results" not in st.session_state or not st.session_state.ai_results:
-        st.info("請先在 Step 2 執行 AI 初篩後再匯出。")
-        return
-
-    # 5A. screening summary
-    screen_rows = []
+def build_screening_df(df: pd.DataFrame, pico: Dict) -> pd.DataFrame:
+    rows = []
     for _, row in df.iterrows():
         pmid = row["pmid"]
         ai_res = st.session_state.ai_results.get(pmid, {})
@@ -792,7 +791,7 @@ def task_5_export_tables(df: pd.DataFrame, pico: Dict):
         ft_reason = st.session_state.fulltext_reasons.get(pmid, "")
         ft_text = st.session_state.fulltext_content.get(pmid, "")
 
-        screen_rows.append(
+        rows.append(
             {
                 "pmid": pmid,
                 "source": row.get("source", ""),
@@ -819,14 +818,27 @@ def task_5_export_tables(df: pd.DataFrame, pico: Dict):
                 "FT_fulltext_text": ft_text,
             }
         )
-    screening_df = pd.DataFrame(screen_rows)
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# Step 5. 匯出：screening summary / excluded / unsure / data extraction
+# =========================================================
+def task_5_export_tables(df: pd.DataFrame, pico: Dict):
+    st.header("Step 5. 匯出清單（含 PICO & Data extraction template）")
+
+    if "ai_results" not in st.session_state or not st.session_state.ai_results:
+        st.info("請先在 Step 2 執行 AI 初篩後再匯出。")
+        return
+
+    screening_df = build_screening_df(df, pico)
 
     st.subheader("5A. screening summary 預覽（全部文章）")
     st.dataframe(screening_df, use_container_width=True)
 
     csv_screen = screening_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "下載 screening summary CSV（含 PICO / AI / TA / full-text 決策＋全文貼上）",
+        "下載 screening summary CSV",
         data=csv_screen,
         file_name="srma_screening_summary.csv",
         mime="text/csv",
@@ -852,7 +864,7 @@ def task_5_export_tables(df: pd.DataFrame, pico: Dict):
 
         csv_excluded = excluded_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
-            "下載『被排除文章＋AI 理由』CSV（給 PRISMA 附錄用）",
+            "下載『被排除文章＋AI 理由』CSV",
             data=csv_excluded,
             file_name="srma_excluded_title_abstract.csv",
             mime="text/csv",
@@ -890,24 +902,17 @@ def task_5_export_tables(df: pd.DataFrame, pico: Dict):
 
     st.markdown("---")
 
-    # 5B. Data extraction 表
+    # 5B. Data extraction template（先匯出一份，Step 6 會在頁面上讓你填 effect / CI）
     extract_rows = []
-    for _, row in df.iterrows():
-        pmid = row["pmid"]
-        ta_human = st.session_state.decisions.get(pmid, "")
-        ft_dec = st.session_state.fulltext_decisions.get(pmid, "Not reviewed yet")
-        ft_reason = st.session_state.fulltext_reasons.get(pmid, "")
-        ft_text = st.session_state.fulltext_content.get(pmid, "")
-        ai_res = st.session_state.ai_results.get(pmid, {})
-
+    for _, row in screening_df.iterrows():
         extract_rows.append(
             {
-                "PMID_or_ID": pmid,
-                "Source": row.get("source", ""),
-                "URL": row.get("url", ""),
-                "DOI": row.get("doi", ""),
-                "First author": row.get("first_author", ""),
-                "Year": row.get("year", ""),
+                "PMID_or_ID": row["pmid"],
+                "Source": row["source"],
+                "URL": row["url"],
+                "DOI": row["doi"],
+                "First author": row["first_author"],
+                "Year": row["year"],
                 "Country": "",
                 "Experimental": "",
                 "Sample size (Exp)": "",
@@ -917,26 +922,31 @@ def task_5_export_tables(df: pd.DataFrame, pico: Dict):
                 "Follow-up": "",
                 "Outcomes": "",
                 "Title": row["title"],
-                "P_query": pico.get("P", ""),
-                "I_query": pico.get("I", ""),
-                "C_query": pico.get("C", ""),
-                "O_query": pico.get("O", ""),
-                "X_query": pico.get("X", ""),
-                "AI_label": ai_res.get("label", ""),
-                "TA_decision": ta_human,
-                "FT_decision": ft_dec,
-                "FT_reason": ft_reason,
-                "FT_fulltext_snippet": ft_text,
+                "P_query": row["P_query"],
+                "I_query": row["I_query"],
+                "C_query": row["C_query"],
+                "O_query": row["O_query"],
+                "X_query": row["X_query"],
+                "AI_label": row["AI_label"],
+                "TA_decision": row["TA_decision"],
+                "FT_decision": row["FT_decision"],
+                "FT_reason": row["FT_reason"],
+                "FT_fulltext_snippet": row["FT_fulltext_text"],
+                "Effect_measure": "",
+                "Effect": "",
+                "Lower_CI": "",
+                "Upper_CI": "",
             }
         )
+
     extraction_df = pd.DataFrame(extract_rows)
 
-    st.subheader("5B. Data extraction 表格預覽")
+    st.subheader("5B. Data extraction template 預覽")
     st.dataframe(extraction_df, use_container_width=True)
 
     csv_extract = extraction_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "下載 data extraction CSV（欄位如 SRMA 萃取表＋來源 URL＋full-text 決策）",
+        "下載 data extraction CSV（含 effect 欄位）",
         data=csv_extract,
         file_name="srma_data_extraction_template.csv",
         mime="text/csv",
@@ -944,9 +954,245 @@ def task_5_export_tables(df: pd.DataFrame, pico: Dict):
 
 
 # =========================================================
+# Step 6. 互動式 Data extraction ＋ 森林圖（fixed effect）
+# =========================================================
+def task_6_extraction_and_forest(df: pd.DataFrame, pico: Dict):
+    st.header("Step 6. Data extraction + 森林圖（固定效果）")
+
+    if "ai_results" not in st.session_state or not st.session_state.ai_results:
+        st.info("請先完成 Step 2 / Step 3 的初篩。")
+        return
+
+    if not HAS_ALTAIR:
+        st.warning("目前環境沒有安裝 Altair，無法畫森林圖，但你仍可匯出 data extraction CSV。")
+        return
+
+    screening_df = build_screening_df(df, pico)
+
+    # 候選研究：Include for meta-analysis 或 TA 已 Include
+    candidates = screening_df[
+        (screening_df["FT_decision"] == "Include for meta-analysis")
+        | (
+            (screening_df["FT_decision"] == "Not reviewed yet")
+            & (screening_df["TA_decision"] == "Include")
+        )
+    ].copy()
+
+    if candidates.empty:
+        st.info("目前沒有任何研究被標記為『Include for meta-analysis』或 Title/Abstract 為 Include。")
+        return
+
+    st.markdown(
+        """
+1. 對下列表格中的研究，選擇 effect measure（RR / OR / HR / MD / SMD / Risk difference / Other）。  
+2. 填入 Effect、Lower 95% CI、Upper 95% CI。  
+3. 選擇要合併的 effect measure，系統會用 fixed-effect 模型計算 pooled effect 並畫森林圖。  
+"""
+    )
+
+    base_cols = [
+        "pmid",
+        "source",
+        "url",
+        "doi",
+        "first_author",
+        "year",
+        "title",
+        "TA_decision",
+        "FT_decision",
+    ]
+    base = candidates[base_cols].rename(
+        columns={
+            "pmid": "PMID_or_ID",
+            "title": "Title",
+        }
+    )
+
+    # 若之前已經在 session 裡編輯過，沿用舊值
+    prev = st.session_state.get("extract_editor_df")
+    if prev is not None:
+        base = base.merge(
+            prev[["PMID_or_ID", "Effect_measure", "Effect", "Lower_CI", "Upper_CI"]],
+            on="PMID_or_ID",
+            how="left",
+        )
+
+    if "Effect_measure" not in base.columns:
+        base["Effect_measure"] = ""
+    if "Effect" not in base.columns:
+        base["Effect"] = ""
+    if "Lower_CI" not in base.columns:
+        base["Lower_CI"] = ""
+    if "Upper_CI" not in base.columns:
+        base["Upper_CI"] = ""
+
+    st.subheader("6A. 手動填寫 effect / CI（可在頁面上直接編輯）")
+
+    edited = st.data_editor(
+        base,
+        key="extract_editor",
+        use_container_width=True,
+        num_rows="dynamic",
+        column_config={
+            "PMID_or_ID": st.column_config.TextColumn("PMID/ID", disabled=True),
+            "Title": st.column_config.TextColumn("Title", disabled=True, width="large"),
+            "Effect_measure": st.column_config.SelectboxColumn(
+                "Effect measure",
+                options=["", "RR", "OR", "HR", "MD", "SMD", "Risk difference", "Other"],
+                required=False,
+            ),
+            "Effect": st.column_config.NumberColumn("Effect", format="%.3f", required=False),
+            "Lower_CI": st.column_config.NumberColumn("Lower 95% CI", format="%.3f", required=False),
+            "Upper_CI": st.column_config.NumberColumn("Upper 95% CI", format="%.3f", required=False),
+        },
+        hide_index=True,
+    )
+    st.session_state.extract_editor_df = edited
+
+    csv_cur = edited.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "下載目前的 data extraction CSV（含 effect 資料）",
+        data=csv_cur,
+        file_name="srma_data_extraction_with_effect.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("---")
+
+    st.subheader("6B. 選擇 effect measure 並產生森林圖（fixed effect）")
+
+    selected_measure = st.selectbox(
+        "要合併哪一種 effect measure？",
+        ["RR", "OR", "HR", "MD", "SMD", "Risk difference", "Other"],
+    )
+
+    sub = edited[(edited["Effect_measure"] == selected_measure)].copy()
+    sub = sub.dropna(subset=["Effect", "Lower_CI", "Upper_CI"])
+
+    if sub.empty:
+        st.info("目前在此 effect measure 底下沒有填好 Effect + CI 的研究。")
+        return
+
+    # 轉成數值
+    for col in ["Effect", "Lower_CI", "Upper_CI"]:
+        sub[col] = pd.to_numeric(sub[col], errors="coerce")
+    sub = sub.dropna(subset=["Effect", "Lower_CI", "Upper_CI"])
+
+    if sub.empty:
+        st.error("Effect / Lower_CI / Upper_CI 中有非數值內容，清理後已無有效資料。")
+        return
+
+    eff = sub["Effect"].tolist()
+    lcl = sub["Lower_CI"].tolist()
+    ucl = sub["Upper_CI"].tolist()
+
+    ratio_measures = {"RR", "OR", "HR"}
+
+    if selected_measure in ratio_measures:
+        # 在 log scale 合併，再轉回原尺度
+        if any(x <= 0 for x in eff + lcl + ucl):
+            st.error("RR/OR/HR 需要都是正值才能取 log，請確認資料。")
+            return
+
+        log_eff = [math.log(x) for x in eff]
+        log_lcl = [math.log(x) for x in lcl]
+        log_ucl = [math.log(x) for x in ucl]
+
+        se = [(hi - lo) / (2 * 1.96) for lo, hi in zip(log_lcl, log_ucl)]
+        weights = [1.0 / (s ** 2) if s > 0 else 0.0 for s in se]
+        sum_w = sum(weights)
+
+        if sum_w == 0:
+            st.error("權重總和為 0，無法計算 pooled effect。")
+            return
+
+        pooled_log = sum(w * x for w, x in zip(weights, log_eff)) / sum_w
+        se_pool = math.sqrt(1.0 / sum_w)
+        pooled_log_lcl = pooled_log - 1.96 * se_pool
+        pooled_log_ucl = pooled_log + 1.96 * se_pool
+
+        pooled = math.exp(pooled_log)
+        pooled_lcl = math.exp(pooled_log_lcl)
+        pooled_ucl = math.exp(pooled_log_ucl)
+    else:
+        # 直接以原尺度合併
+        se = [(hi - lo) / (2 * 1.96) for lo, hi in zip(lcl, ucl)]
+        weights = [1.0 / (s ** 2) if s > 0 else 0.0 for s in se]
+        sum_w = sum(weights)
+
+        if sum_w == 0:
+            st.error("權重總和為 0，無法計算 pooled effect。")
+            return
+
+        pooled = sum(w * x for w, x in zip(weights, eff)) / sum_w
+        se_pool = math.sqrt(1.0 / sum_w)
+        pooled_lcl = pooled - 1.96 * se_pool
+        pooled_ucl = pooled + 1.96 * se_pool
+
+    st.write(
+        f"Fixed-effect pooled {selected_measure} = **{pooled:.3f}** "
+        f"(95% CI {pooled_lcl:.3f} – {pooled_ucl:.3f})"
+    )
+
+    # 準備畫森林圖的資料
+    plot_df = pd.DataFrame(
+        {
+            "Study": [
+                f"{str(r['PMID_or_ID'])} | "
+                f"{(str(r['Title'])[:37] + '...') if len(str(r['Title'])) > 40 else str(r['Title'])}"
+                for _, r in sub.iterrows()
+            ],
+            "Effect": eff,
+            "Lower_CI": lcl,
+            "Upper_CI": ucl,
+        }
+    )
+
+    # Altair 森林圖：水平方向 CI + 點 + pooled 垂直線
+    ci_layer = (
+        alt.Chart(plot_df)
+        .mark_rule()
+        .encode(
+            y=alt.Y("Study:N", sort="-x"),
+            x=alt.X("Lower_CI:Q"),
+            x2="Upper_CI:Q",
+        )
+    )
+
+    point_layer = (
+        alt.Chart(plot_df)
+        .mark_point(size=60)
+        .encode(
+            y=alt.Y("Study:N", sort="-x"),
+            x=alt.X("Effect:Q"),
+        )
+    )
+
+    pooled_df = pd.DataFrame({"x": [pooled]})
+    pooled_line = (
+        alt.Chart(pooled_df)
+        .mark_rule(strokeDash=[4, 4], color="red")
+        .encode(x="x:Q")
+    )
+
+    chart = (ci_layer + point_layer + pooled_line).properties(
+        width=600,
+        height=max(200, 25 * len(plot_df)),
+        title=f"Forest plot (fixed-effect, {selected_measure})",
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
+    st.caption(
+        "提醒：這裡是簡化版森林圖與固定效果合併，假設各研究 effect 已經是可直接合併的尺度。"
+    )
+
+
+# =========================================================
 # 主程式流程
 # =========================================================
-st.title("眼科 SRMA 自動化 Prototype（多資料庫＋AI 初篩＋Covidence 風格介面）")
+st.title("眼科 SRMA 自動化 Prototype")
+st.caption("作者：Ya Hsin Yao（TSGH Ophthalmology Lab）")
 
 pico, query, retmax, sources = task_1_pico_input()
 
@@ -1008,7 +1254,8 @@ if (
 ):
     df = st.session_state.df
     task_3_screening_ui(df)
-    task_6_prisma_summary(df)
+    task_4_prisma_summary(df)
     task_5_export_tables(df, pico)
+    task_6_extraction_and_forest(df, pico)
 else:
     st.info("請先完成 Step 2 抓取文獻。")
