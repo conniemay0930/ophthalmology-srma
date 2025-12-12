@@ -5,7 +5,7 @@
 # - 自動把 P/I/C/O/extra 轉成 (term[tiab] OR "term"[MeSH Terms])
 # - 統一欄位：pmid(主鍵) / doi / title / abstract / year / first_author / source / url
 # - AI rule-based 初篩 (Include / Exclude / Unsure + 理由 + 信心度)
-# - Covidence 風格 Title/Abstract screening：expander 卡片 + radio 按鈕
+# - Title/Abstract screening：expander 卡片 + radio 按鈕
 # - Full-text decision + reason + 可貼上全文
 # - PRISMA 簡化數字（只看當次搜尋）＋ Unsure 清單
 # - 匯出：screening summary / Excluded / Unsure / data extraction template
