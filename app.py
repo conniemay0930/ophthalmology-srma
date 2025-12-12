@@ -1,631 +1,617 @@
-{\rtf1\ansi\ansicpg950\cocoartf2822
-\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
-{\colortbl;\red255\green255\blue255;}
-{\*\expandedcolortbl;;}
-\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
-\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+# =========================================================
+# Ophthalmology SRMA Prototype
+# - PICO-aware AI screening (PICO 可留空)
+# - 自動把 PICO 轉成 keyword[tiab] OR "keyword"[MeSH Terms]
+# - NOT exclude 關鍵字
+# - PubMed: PMID + DOI + First author + Year + Title + Abstract
+# - Title/abstract AI 初篩 + 人工覆寫
+# - Full-text 決策 & 理由回填，匯出到 Excel
+# =========================================================
 
-\f0\fs24 \cf0 import streamlit as st\
-import requests\
-import xml.etree.ElementTree as ET\
-import pandas as pd\
-import math\
-import os\
-import json\
-\
-# =========================\
-#  \uc0\u22522 \u26412 \u35498 \u26126 \
-# =========================\
-st.title("\uc0\u30524 \u31185  SRMA \u33258 \u21205 \u21270  Prototype\u65288 \u21547  GPT / Gemini AI \u21021 \u31721 \u65289 ")\
-\
-st.write(\
-    """\
-    \uc0\u21151 \u33021 \u27969 \u31243 \u65306 \
-    1. \uc0\u36664 \u20837  PICO \u8594  \u33258 \u21205 \u32068 \u20986  PubMed \u25628 \u23563 \u24335 \u65288 \u21547 \u31777 \u21934  MeSH / \u21516 \u32681 \u35422 \u24314 \u35696 \u65289   \
-    2. \uc0\u21628 \u21483  PubMed API \u25235 \u22238 \u25991 \u29563 \u12289 \u21435 \u37325 \u20006 \u35336 \u31639  PRISMA \u25976 \u23383   \
-    3. \uc0\u26681 \u25818 \u12300 \u30070 \u21069  PICO\u12301 \u65291 \u65288 \u36984 \u29992 \u65289 GPT / Gemini \u23565 \u27599 \u31687 \u25991 \u29563 \u20570  AI \u21021 \u31721  (Include / Exclude / Unsure) \u20006 \u38468 \u29702 \u30001 \u65292 \u21487 \u36880 \u31687 \u20154 \u24037 \u26657 \u27491   \
-    4. \uc0\u19978 \u20659  effect size CSV\u65292 \u35336 \u31639  fixed-effect pooled effect\u65288 \u25991 \u23383 \u32080 \u26524 \u65289 \
-    """\
-)\
-\
-# =========================\
-#  LLM \uc0\u35373 \u23450 \u65288 \u20596 \u37002 \u27396 \u65306 \u21487 \u20999 \u25563  GPT / Gemini / \u19981 \u29992  LLM\u65289 \
-# =========================\
-st.sidebar.header("LLM \uc0\u35373 \u23450 ")\
-\
-llm_provider = st.sidebar.selectbox(\
-    "AI \uc0\u27169 \u22411 \u20358 \u28304 \u65288 \u29992 \u20358 \u20570 \u21021 \u31721 \u33287 \u23531 \u29702 \u30001 \u65289 ",\
-    [\
-        "\uc0\u19981 \u20351 \u29992  LLM\u65288 \u20677 \u35215 \u21063 \u29256 \u65289 ",\
-        "OpenAI GPT",\
-        "Google Gemini",\
-    ],\
-)\
-\
-st.session_state.llm_provider = llm_provider\
-\
-# \uc0\u27298 \u26597  API key \u26159 \u21542 \u23384 \u22312 \u65288 \u25918 \u22312 \u29872 \u22659 \u35722 \u25976 \u25110  .streamlit/secrets.toml \u30342 \u21487 \u65289 \
-openai_key = st.secrets.get("OPENAI_API_KEY", None) or os.environ.get("OPENAI_API_KEY")\
-gemini_key = (\
-    st.secrets.get("GEMINI_API_KEY", None)\
-    or os.environ.get("GEMINI_API_KEY")\
-    or os.environ.get("GOOGLE_API_KEY")\
-)\
-\
-if llm_provider == "OpenAI GPT":\
-    if not openai_key:\
-        st.sidebar.warning("\uc0\u26410 \u20597 \u28204 \u21040  OPENAI_API_KEY\u65292 \u23526 \u38555 \u26371 \u36864 \u22238 \u35215 \u21063 \u29256 \u21028 \u35712 \u12290 ")\
-elif llm_provider == "Google Gemini":\
-    if not gemini_key:\
-        st.sidebar.warning("\uc0\u26410 \u20597 \u28204 \u21040  GEMINI_API_KEY / GOOGLE_API_KEY\u65292 \u23526 \u38555 \u26371 \u36864 \u22238 \u35215 \u21063 \u29256 \u21028 \u35712 \u12290 ")\
-\
-\
-# =========================\
-#  PubMed utilities\
-# =========================\
-def pubmed_esearch(term: str, retmax: int = 50):\
-    """\uc0\u29992  ESearch \u21040  PubMed \u21462 \u24471  PMID list\u12290 """\
-    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"\
-    params = \{\
-        "db": "pubmed",\
-        "term": term,\
-        "retmode": "json",\
-        "retmax": retmax,\
-    \}\
-    r = requests.get(url, params=params, timeout=30)\
-    r.raise_for_status()\
-    data = r.json()\
-    return data["esearchresult"]["idlist"]\
-\
-\
-def pubmed_efetch(id_list):\
-    """\uc0\u29992  EFetch \u25235 \u22238  PubMed \u35443 \u32048 \u36039 \u26009 \u65292 \u22238 \u20659  dict list\u12290 """\
-    if not id_list:\
-        return []\
-\
-    ids = ",".join(id_list)\
-    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"\
-    params = \{\
-        "db": "pubmed",\
-        "id": ids,\
-        "retmode": "xml",\
-    \}\
-    r = requests.get(url, params=params, timeout=60)\
-    r.raise_for_status()\
-\
-    root = ET.fromstring(r.text)\
-    records = []\
-\
-    for article in root.findall(".//PubmedArticle"):\
-        pmid_el = article.find(".//PMID")\
-        title_el = article.find(".//ArticleTitle")\
-        doi_el = article.find(".//ArticleId[@IdType='doi']")\
-\
-        pmid = pmid_el.text if pmid_el is not None else ""\
-        title = title_el.text if title_el is not None else ""\
-        doi = doi_el.text if doi_el is not None else ""\
-\
-        # \uc0\u25235 \u25152 \u26377  AbstractText\u65292 \u21253 \u21547 \u26377  Label \u30340 \u22810 \u27573 \u25688 \u35201 \
-        abstract_parts = []\
-        for ab in article.findall(".//AbstractText"):\
-            if ab.text:\
-                label = ab.get("Label")\
-                if label:\
-                    abstract_parts.append(f"\{label\}: \{ab.text\}")\
-                else:\
-                    abstract_parts.append(ab.text)\
-        abstract = "\\n".join(abstract_parts) if abstract_parts else ""\
-\
-        records.append(\
-            \{\
-                "PMID": pmid,\
-                "Title": title,\
-                "Abstract": abstract,\
-                "DOI": doi,\
-            \}\
-        )\
-\
-    return records\
-\
-\
-# =========================\
-#  MeSH / \uc0\u21516 \u32681 \u35422 \u24314 \u35696 \u65288 \u31777 \u21270 \u29256 \u65292 \u21487 \u20043 \u24460 \u25563 \u25104  LLM \u25110 \u30495 \u27491  MeSH \u26597 \u35426 \u65289 \
-# =========================\
-def suggest_mesh_block(term: str, role: str):\
-    """\
-    \uc0\u26681 \u25818 \u36664 \u20837  term \u29986 \u29983 \u19968 \u27573 \u24314 \u35696 \u25628 \u23563 \u24335  (string)\u12290 \
-    role: "P" / "I" / "C" / "O"\uc0\u65292 \u30446 \u21069 \u20677 \u20570 \u23569 \u37327 \u30524 \u31185 \u29305 \u20363 \u12290 \
-    """\
-    if not term:\
-        return ""\
-\
-    t = term.lower().strip()\
-\
-    # \uc0\u24120 \u35211 \u30524 \u31185 \u35422 \u29305 \u20363 \
-    if "glaucoma" in t:\
-        return "(glaucoma[MeSH Terms] OR glaucoma* OR ocular hypertension)"\
-    if "cataract" in t:\
-        return "(Cataract[MeSH Terms] OR cataract* OR lens opacity)"\
-    if "edof" in t and "iol" in t:\
-        return "(\\"extended depth of focus\\" OR EDOF OR \\"extended depth-of-focus\\" OR presbyopia-correcting IOL OR Intraocular Lenses[MeSH Terms])"\
-    if "iol" in t or "intraocular lens" in t:\
-        return "(Intraocular Lenses[MeSH Terms] OR intraocular lens* OR IOL*)"\
-\
-    # \uc0\u36890 \u29992  fallback\
-    return f"(\{term\}[MeSH Terms] OR \{term\})"\
-\
-\
-def build_pubmed_query(p, i, c, o, extra, add_rct_filter):\
-    """\uc0\u25226  PICO + \u38989 \u22806 \u26781 \u20214 \u36681 \u25104  PubMed \u25628 \u23563 \u24335 \u65292 \u20839 \u21547 \u31777 \u26131  MeSH block\u12290 """\
-    blocks = []\
-\
-    if p:\
-        blocks.append(suggest_mesh_block(p, "P"))\
-    if i:\
-        blocks.append(suggest_mesh_block(i, "I"))\
-    if c:\
-        blocks.append(suggest_mesh_block(c, "C"))\
-    if o:\
-        blocks.append(suggest_mesh_block(o, "O"))\
-\
-    query = " AND ".join(blocks) if blocks else ""\
-\
-    if extra.strip():\
-        query = f"\{query\} AND (\{extra.strip()\})" if query else extra.strip()\
-\
-    if add_rct_filter:\
-        rct_block = "(randomized controlled trial[pt] OR randomized[tiab] OR randomised[tiab])"\
-        query = f"\{query\} AND \{rct_block\}" if query else rct_block\
-\
-    return query\
-\
-\
-# =========================\
-#  LLM helper\uc0\u65306 \u21628 \u21483  GPT / Gemini \u20570 \u21021 \u31721 \u65288 \u33509 \u22833 \u25943 \u23601 \u22238  None\u65289 \
-# =========================\
-def extract_json_like(text: str):\
-    """\uc0\u24478  LLM \u22238 \u35206 \u20013 \u30433 \u37327 \u25235 \u20986 \u31532 \u19968 \u27573  JSON\u65292 \u22833 \u25943 \u23601 \u19999 \u20363 \u22806 \u12290 """\
-    first = text.find("\{")\
-    last = text.rfind("\}")\
-    if first == -1 or last == -1 or last <= first:\
-        raise ValueError("No JSON found")\
-    snippet = text[first : last + 1]\
-    return json.loads(snippet)\
-\
-\
-def llm_screening(title: str, abstract: str, pico: dict, provider: str):\
-    """\
-    \uc0\u29992  LLM \u20570  include/exclude/unsure \u21028 \u26039 \u12290 \
-    \uc0\u22238 \u20659  (label, reason) \u25110  None \u34920 \u31034 \u22833 \u25943 \u65292 \u22806 \u38754 \u20877  fallback \u21040 \u35215 \u21063 \u29256 \u12290 \
-    """\
-    if provider == "OpenAI GPT" and openai_key:\
-        try:\
-            from openai import OpenAI  # type: ignore\
-\
-            client = OpenAI(api_key=openai_key)\
-\
-            prompt = f"""\
-You are assisting in a systematic review in ophthalmology.\
-\
-The PICO of the current review is:\
-P: \{pico.get('P', '')\}\
-I: \{pico.get('I', '')\}\
-C: \{pico.get('C', '')\}\
-O: \{pico.get('O', '')\}\
-\
-Given the following PubMed record (title and abstract), decide whether it should be:\
-- "Include" (matches PICO reasonably well and likely relevant),\
-- "Exclude" (clearly not related),\
-- or "Unsure" (partially related or insufficient information).\
-\
-Title:\
-\{title\}\
-\
-Abstract:\
-\{abstract\}\
-\
-Return ONLY a JSON object in the following format:\
-\
-\{\{\
-  "label": "Include or Exclude or Unsure",\
-  "reason": "A short explanation in Chinese, explicitly mentioning which parts of PICO match or mismatch."\
-\}\}\
-"""\
-            resp = client.responses.create(\
-                model="gpt-5.1-mini",  # \uc0\u21487 \u35222 \u24773 \u27841 \u25913 \u20854 \u20182 \u22411 \u34399 \
-                input=prompt,\
-            )\
-            text = resp.output_text\
-            data = extract_json_like(text)\
-            label = data.get("label", "").strip()\
-            reason = data.get("reason", "").strip()\
-            if label not in ["Include", "Exclude", "Unsure"]:\
-                raise ValueError("Invalid label from GPT")\
-            return label, reason or "\uc0\u65288 GPT \u26410 \u25552 \u20379 \u29702 \u30001 \u65289 "\
-        except Exception as e:\
-            # \uc0\u22312  UI \u20013 \u39023 \u31034 \u19968 \u27425 \u21363 \u21487 \u65292 \u36991 \u20813 \u27927 \u29256 \
-            st.warning(f"GPT \uc0\u21021 \u31721 \u20986 \u37679 \u65292 \u24050 \u25913 \u29992 \u35215 \u21063 \u29256 \u12290 \u35443 \u32048 \u35338 \u24687 \u65306 \{e\}")\
-            return None\
-\
-    if provider == "Google Gemini" and gemini_key:\
-        try:\
-            import google.generativeai as genai  # type: ignore\
-\
-            genai.configure(api_key=gemini_key)\
-            model = genai.GenerativeModel("gemini-1.5-flash")\
-\
-            prompt = f"""\
-You are assisting in a systematic review in ophthalmology.\
-\
-The PICO of the current review is:\
-P: \{pico.get('P', '')\}\
-I: \{pico.get('I', '')\}\
-C: \{pico.get('C', '')\}\
-O: \{pico.get('O', '')\}\
-\
-Given the following PubMed record (title and abstract), decide whether it should be:\
-- "Include" (matches PICO reasonably well and likely relevant),\
-- "Exclude" (clearly not related),\
-- or "Unsure" (partially related or insufficient information).\
-\
-Title:\
-\{title\}\
-\
-Abstract:\
-\{abstract\}\
-\
-Return ONLY a JSON object in the following format:\
-\
-\{\{\
-  "label": "Include or Exclude or Unsure",\
-  "reason": "A short explanation in Chinese, explicitly mentioning which parts of PICO match or mismatch."\
-\}\}\
-"""\
-            resp = model.generate_content(prompt)\
-            text = resp.text or ""\
-            data = extract_json_like(text)\
-            label = data.get("label", "").strip()\
-            reason = data.get("reason", "").strip()\
-            if label not in ["Include", "Exclude", "Unsure"]:\
-                raise ValueError("Invalid label from Gemini")\
-            return label, reason or "\uc0\u65288 Gemini \u26410 \u25552 \u20379 \u29702 \u30001 \u65289 "\
-        except Exception as e:\
-            st.warning(f"Gemini \uc0\u21021 \u31721 \u20986 \u37679 \u65292 \u24050 \u25913 \u29992 \u35215 \u21063 \u29256 \u12290 \u35443 \u32048 \u35338 \u24687 \u65306 \{e\}")\
-            return None\
-\
-    # \uc0\u33509  provider \u19981 \u31526 \u25110 \u27794  key\
-    return None\
-\
-\
-# =========================\
-#  \uc0\u35215 \u21063 \u29256 \u21021 \u31721 \u65288 \u30070  LLM \u38364 \u25481 \u25110 \u22833 \u25943 \u26178 \u20351 \u29992 \u65289 \
-# =========================\
-def rule_based_screening(title: str, abstract: str, pico: dict):\
-    """\
-    \uc0\u22238 \u20659  (\u24314 \u35696 \u27161 \u31844 , \u29702 \u30001 \u25991 \u23383 )\
-    label: 'Include' / 'Exclude' / 'Unsure'\
-    """\
-    text = (title or "") + " " + (abstract or "")\
-    low = text.lower()\
-\
-    if not low.strip():\
-        return "Unsure", "Title/Abstract \uc0\u24190 \u20046 \u27794 \u26377 \u20839 \u23481 \u65292 \u28961 \u27861 \u26681 \u25818  PICO \u21028 \u35712 \u65292 \u24314 \u35696 \u20154 \u24037 \u27298 \u35222 \u20840 \u25991 \u12290 "\
-\
-    def count_match(term):\
-        if not term:\
-            return 0\
-        words = [w.strip().lower() for w in term.split() if w.strip()]\
-        return sum(1 for w in words if w in low)\
-\
-    p_match = count_match(pico.get("P", ""))\
-    i_match = count_match(pico.get("I", ""))\
-    c_match = count_match(pico.get("C", ""))\
-    o_match = count_match(pico.get("O", ""))\
-\
-    total_match = p_match + i_match + c_match + o_match\
-    is_trial = any(k in low for k in ["randomized", "randomised", "prospective", "trial"])\
-\
-    if total_match == 0:\
-        label = "Exclude"\
-        reason = "Title/Abstract \uc0\u24190 \u20046 \u27794 \u26377 \u25552 \u21040 \u30070 \u21069  PICO \u30340  Population / Intervention / Comparison / Outcome\u65292 \u25512 \u28204 \u30740 \u31350 \u20027 \u38988 \u33287 \u26412 \u27425 \u21839 \u38988 \u38364 \u32879 \u24230 \u20302 \u12290 "\
-        return label, reason\
-\
-    if (p_match > 0 or i_match > 0) and is_trial:\
-        label = "Include"\
-        reason_parts = []\
-        if p_match > 0:\
-            reason_parts.append("Population \uc0\u33287  P \u23383 \u20018 \u26377 \u23565 \u25033 \u38364 \u37749 \u35422 ")\
-        if i_match > 0:\
-            reason_parts.append("Intervention \uc0\u33287  I \u23383 \u20018 \u26377 \u23565 \u25033 \u38364 \u37749 \u35422 ")\
-        if c_match > 0:\
-            reason_parts.append("Comparison \uc0\u33287  C \u23383 \u20018 \u21487 \u33021 \u26377 \u37096 \u20998 \u23565 \u25033 ")\
-        if o_match > 0:\
-            reason_parts.append("Outcome \uc0\u33287  O \u23383 \u20018 \u26377 \u30456 \u38364 \u25551 \u36848 ")\
-        reason = "\uc0\u65292 \u65307 ".join(reason_parts)\
-        reason += "\uc0\u12290 \u19988 \u25688 \u35201 \u20013 \u25552 \u21040  randomized/prospective/trial\u65292 \u25512 \u28204 \u28858 \u20171 \u20837 \u24615 \u35430 \u39511 \u65292 \u26283 \u21015 \u28858  Include\u65292 \u24453 \u20154 \u24037 \u35079 \u26680 \u12290 "\
-        return label, reason\
-\
-    label = "Unsure"\
-    reason = (\
-        f"Title/Abstract \uc0\u20013 \u23565 \u26044  P/I/C/O \u26377  \{total_match\} \u20491 \u38364 \u37749 \u35422 \u21629 \u20013 "\
-        "\uc0\u65288 \u33267 \u23569 \u37096 \u20998 \u20839 \u23481 \u33287 \u30070 \u21069  PICO \u30456 \u31526 \u65289 \u65292 \u20294 \u26410 \u26126 \u30906 \u39023 \u31034 \u28858 \u38568 \u27231 \u23565 \u29031 \u35430 \u39511 \u25110 \u30740 \u31350 \u35373 \u35336 \u19981 \u28165 \u65292 \u26283 \u21015  Unsure\u65292 \u24314 \u35696 \u20154 \u24037 \u21028 \u35712 \u33287 \u30475 \u20840 \u25991 \u12290 "\
-    )\
-    return label, reason\
-\
-\
-def ai_screening_suggestion(title: str, abstract: str, pico: dict, provider: str):\
-    """\
-    \uc0\u20808 \u22039 \u35430 \u29992  LLM\u65307 \u33509  provider \u35373 \u28858 \u19981 \u29992 \u25110  LLM \u22833 \u25943 \u65292 \u23601  fallback \u21040 \u35215 \u21063 \u29256 \u12290 \
-    """\
-    if provider != "\uc0\u19981 \u20351 \u29992  LLM\u65288 \u20677 \u35215 \u21063 \u29256 \u65289 ":\
-        llm_result = llm_screening(title, abstract, pico, provider)\
-        if llm_result is not None:\
-            return llm_result\
-\
-    # fallback\
-    return rule_based_screening(title, abstract, pico)\
-\
-\
-# =========================\
-#  \uc0\u21021 \u22987 \u21270  session_state\
-# =========================\
-if "decisions" not in st.session_state:\
-    st.session_state.decisions = \{\}          # PMID -> final decision\
-if "ai_suggestions" not in st.session_state:\
-    st.session_state.ai_suggestions = \{\}     # PMID -> (label, reason)\
-if "results_df" not in st.session_state:\
-    st.session_state.results_df = None\
-if "last_query" not in st.session_state:\
-    st.session_state.last_query = ""\
-if "prisma" not in st.session_state:\
-    st.session_state.prisma = \{\}\
-if "pico" not in st.session_state:\
-    st.session_state.pico = \{\}\
-\
-\
-# =========================\
-#  Step 1: PICO \uc0\u36664 \u20837 \
-# =========================\
-st.header("Step 1\uc0\u65306 \u36664 \u20837  PICO")\
-\
-col1, col2 = st.columns(2)\
-with col1:\
-    p = st.text_input("P (Population)", "glaucoma patients")\
-    i = st.text_input("I (Intervention)", "trabeculectomy")\
-with col2:\
-    c = st.text_input("C (Comparison)", "tube shunt")\
-    o = st.text_input("O (Outcome)", "intraocular pressure reduction")\
-\
-extra = st.text_input(\
-    "\uc0\u38989 \u22806 \u38364 \u37749 \u23383 \u65295 \u38480 \u21046 \u65288 \u21487 \u30041 \u30333 \u65292 \u20363 \u22914 : selective laser trabeculoplasty\u65289 ", ""\
-)\
-\
-add_rct_filter = st.checkbox("\uc0\u33258 \u21205 \u21152 \u19978  RCT \u38364 \u37749 \u23383 ", value=True)\
-\
-retmax = st.slider("\uc0\u25235 \u22238 \u25991 \u29563 \u25976 \u37327  (records identified)", 10, 200, 50)\
-\
-st.session_state.pico = \{"P": p, "I": i, "C": c, "O": o\}\
-\
-st.markdown("#### \uc0\u24314 \u35696 \u30340  PICO \u23565 \u25033 \u25628 \u23563 \u22602 \u65288 \u31777 \u26131  MeSH / \u21516 \u32681 \u35422 \u65289 ")\
-with st.expander("\uc0\u40670 \u38283 \u30475 \u24314 \u35696 \u25628 \u23563 \u22602 "):\
-    st.write("P block:", suggest_mesh_block(p, "P") if p else "(\uc0\u26410 \u36664 \u20837 )")\
-    st.write("I block:", suggest_mesh_block(i, "I") if i else "(\uc0\u26410 \u36664 \u20837 )")\
-    st.write("C block:", suggest_mesh_block(c, "C") if c else "(\uc0\u26410 \u36664 \u20837 )")\
-    st.write("O block:", suggest_mesh_block(o, "O") if o else "(\uc0\u26410 \u36664 \u20837 )")\
-\
-st.markdown("---")\
-st.header("Step 2\uc0\u65306 \u29986 \u29983  PubMed \u25628 \u23563 \u24335 \u20006 \u25628 \u23563 ")\
-\
-\
-# =========================\
-#  Step 2: \uc0\u25628 \u23563  PubMed + AI \u21021 \u31721 \
-# =========================\
-if st.button("\uc0\u29986 \u29983 \u25628 \u23563 \u24335 \u20006 \u25628 \u23563  PubMed"):\
-    query = build_pubmed_query(p, i, c, o, extra, add_rct_filter)\
-    st.session_state.last_query = query\
-\
-    st.session_state.decisions = \{\}\
-    st.session_state.ai_suggestions = \{\}\
-    st.session_state.prisma = \{\}\
-\
-    with st.spinner("\uc0\u21521  PubMed \u26597 \u35426 \u20013 \u65292 \u35531 \u31245 \u20505 \'85"):\
-        try:\
-            pmids = pubmed_esearch(query, retmax=retmax)\
-            records = pubmed_efetch(pmids)\
-            if not records:\
-                st.warning("\uc0\u27794 \u26377 \u25235 \u21040 \u20219 \u20309 \u25991 \u29563 \u20839 \u23481 \u65292 \u21487 \u33021 \u26159 \u25628 \u23563 \u24335 \u22826 \u22196 \u26684 \u12290 ")\
-                st.session_state.results_df = None\
-            else:\
-                df_raw = pd.DataFrame(records)\
-\
-                identified = len(df_raw)\
-\
-                df_dedup = df_raw.drop_duplicates(\
-                    subset=["PMID", "DOI", "Title"], keep="first"\
-                )\
-                after_dedup = len(df_dedup)\
-\
-                ai_suggestions = \{\}\
-                decisions = \{\}\
-                for idx, row in df_dedup.iterrows():\
-                    pmid = row["PMID"] or f"idx_\{idx\}"\
-                    label, reason = ai_screening_suggestion(\
-                        row["Title"],\
-                        row["Abstract"],\
-                        st.session_state.pico,\
-                        st.session_state.llm_provider,\
-                    )\
-                    ai_suggestions[pmid] = (label, reason)\
-                    decisions[pmid] = label\
-\
-                st.session_state.results_df = df_dedup\
-                st.session_state.ai_suggestions = ai_suggestions\
-                st.session_state.decisions = decisions\
-                st.session_state.prisma = \{\
-                    "identified": identified,\
-                    "after_dedup": after_dedup,\
-                \}\
-\
-                st.success(\
-                    f"\uc0\u25214 \u21040  \{identified\} \u31687 \u25991 \u29563 \u65292 \u21435 \u37325 \u24460 \u21097  \{after_dedup\} \u31687 \u65292 "\
-                    f"\uc0\u24050 \u23436 \u25104  \{'LLM \u39493 \u21205 ' if st.session_state.llm_provider != '\u19981 \u20351 \u29992  LLM\u65288 \u20677 \u35215 \u21063 \u29256 \u65289 ' else '\u35215 \u21063 \u29256 '\} AI \u21021 \u31721 \u12290 "\
-                )\
-\
-        except Exception as e:\
-            st.session_state.results_df = None\
-            st.error(f"\uc0\u25628 \u23563 \u25110 \u19979 \u36617  PubMed \u36039 \u26009 \u26178 \u30332 \u29983 \u37679 \u35492 \u65306 \{e\}")\
-\
-\
-# =========================\
-#  Step 3: \uc0\u39023 \u31034 \u32080 \u26524 \u12289 \u36880 \u31687 \u26657 \u27491  & PRISMA\
-# =========================\
-df = st.session_state.results_df\
-\
-if df is not None and not df.empty:\
-    st.subheader("\uc0\u29986 \u29983 \u30340  PubMed \u25628 \u23563 \u24335 ")\
-    st.code(st.session_state.last_query or "(\uc0\u23578 \u26410 \u25628 \u23563 )", language="text")\
-\
-    st.subheader("\uc0\u25628 \u23563 \u32080 \u26524 \u32317 \u35261 \u65288 \u21547  AI \u24314 \u35696 \u65289 ")\
-    overview_df = df[["PMID", "Title", "DOI"]].copy()\
-    ai_labels = []\
-    for idx, row in df.iterrows():\
-        pmid = row["PMID"] or f"idx_\{idx\}"\
-        label, _ = st.session_state.ai_suggestions.get(pmid, ("\uc0\u26410 \u38928 \u28204 ", ""))\
-        ai_labels.append(label)\
-    overview_df["AI_suggestion"] = ai_labels\
-    st.dataframe(overview_df, use_container_width=True)\
-\
-    st.markdown("---")\
-    st.header("Step 3\uc0\u65306 \u36880 \u31687 \u31721 \u36984  & \u26657 \u27491  AI \u21028 \u35712 ")\
-\
-    include_count = 0\
-    exclude_count = 0\
-    unsure_count = 0\
-\
-    for idx, row in df.iterrows():\
-        pmid = row["PMID"] or f"idx_\{idx\}"\
-        title = row["Title"]\
-        abstract = row["Abstract"]\
-\
-        ai_label, ai_reason = st.session_state.ai_suggestions.get(\
-            pmid, ("\uc0\u26410 \u38928 \u28204 ", "\u65288 \u28961  AI \u29702 \u30001 \u65289 ")\
-        )\
-        current_decision = st.session_state.decisions.get(pmid, ai_label)\
-\
-        with st.expander(f"\{idx+1\}. \{title[:120]\}"):\
-            st.write(f"**PMID:** \{pmid\}")\
-            st.write(f"**AI \uc0\u21021 \u31721 \u24314 \u35696 \u65306 \{ai_label\}**")\
-            st.caption(f"\uc0\u29702 \u30001 \u65306 \{ai_reason\}")\
-\
-            if abstract:\
-                st.write("**Abstract**")\
-                st.write(abstract)\
-            else:\
-                st.write("_No abstract available._")\
-\
-            decision = st.radio(\
-                "\uc0\u20320 \u30340 \u26368 \u32066 \u21028 \u26039 \u65288 \u21487 \u35206 \u23531  AI \u24314 \u35696 \u65289 ",\
-                ["Include", "Exclude", "Unsure"],\
-                index=["Include", "Exclude", "Unsure"].index(\
-                    current_decision\
-                    if current_decision in ["Include", "Exclude", "Unsure"]\
-                    else "Unsure"\
-                ),\
-                key=f"decision_radio_\{pmid\}",\
-            )\
-            st.session_state.decisions[pmid] = decision\
-\
-    for d in st.session_state.decisions.values():\
-        if d == "Include":\
-            include_count += 1\
-        elif d == "Exclude":\
-            exclude_count += 1\
-        elif d == "Unsure":\
-            unsure_count += 1\
-\
-    st.markdown("---")\
-    st.subheader("PRISMA \uc0\u32113 \u35336 \u65288 \u31777 \u21270 \u29256 \u65289 ")\
-    prisma = st.session_state.prisma or \{\}\
-    st.write(\
-        f"Records identified (database searching)\uc0\u65306 \{prisma.get('identified', 'NA')\}"\
-    )\
-    st.write(\
-        f"Records after duplicates removed\uc0\u65306 \{prisma.get('after_dedup', 'NA')\}"\
-    )\
-    st.write(\
-        f"Records included for full-text review (Include)\uc0\u65306 \{include_count\}"\
-    )\
-    st.write(\
-        f"Records marked as Unsure\uc0\u65288 \u21487 \u35222 \u28858 \u24453 \u30906 \u35469  full-text\u65289 \u65306 \{unsure_count\}"\
-    )\
-    st.write(f"Records excluded at screening\uc0\u65306 \{exclude_count\}")\
-\
-else:\
-    st.info("\uc0\u35531 \u20808 \u22312  Step 2 \u29986 \u29983 \u25628 \u23563 \u24335 \u20006 \u25628 \u23563  PubMed\u65292 \u32080 \u26524 \u25165 \u26371 \u39023 \u31034 \u22312 \u36889 \u35041 \u12290 ")\
-\
-\
-# =========================\
-#  Step 4: \uc0\u19978 \u20659  effect size CSV\u65292 \u35336 \u31639  pooled effect\u65288 \u19981 \u30059 \u22294 \u65289 \
-# =========================\
-st.markdown("---")\
-st.header("Step 4\uc0\u65306 \u19978 \u20659  effect size \u36039 \u26009 \u20006 \u35336 \u31639  pooled effect\u65288 \u31034 \u24847 \u29256 \u65289 ")\
-\
-st.write(\
-    """\
-    \uc0\u35531 \u20808 \u20154 \u24037 \u25110 \u20351 \u29992 \u20854 \u20182 \u24037 \u20855 \u23436 \u25104 \u36039 \u26009 \u33795 \u21462 \u65292 \u25972 \u29702 \u25104  CSV\u65292 \u21253 \u21547 \u20197 \u19979 \u27396 \u20301 \u65306 \
-    - study\uc0\u65306 \u30740 \u31350 \u21517 \u31281 \
-    - effect\uc0\u65306 \u25928 \u26524 \u37327 \u65288 \u20363 \u22914  mean difference, log RR \u31561 \u65289 \
-    - ci_lower\uc0\u65306 95% \u20449 \u36084 \u21312 \u38291 \u19979 \u38480 \
-    - ci_upper\uc0\u65306 95% \u20449 \u36084 \u21312 \u38291 \u19978 \u38480 \
-\
-    \uc0\u19978 \u20659 \u24460 \u65292 \u31995 \u32113 \u26371 \u35336 \u31639  fixed-effect pooled effect \u20006 \u39023 \u31034 \u25976 \u20540 \u32080 \u26524 \u65288 \u26283 \u19981 \u30059 \u26862 \u26519 \u22294 \u65289 \u12290 \
-    """\
-)\
-\
-uploaded = st.file_uploader("\uc0\u19978 \u20659  effect size CSV", type="csv")\
-\
-if uploaded is not None:\
-    try:\
-        eff_df = pd.read_csv(uploaded)\
-    except Exception as e:\
-        st.error(f"\uc0\u35712 \u21462  CSV \u26178 \u30332 \u29983 \u37679 \u35492 \u65306 \{e\}")\
-        eff_df = None\
-\
-    if eff_df is not None:\
-        required_cols = \{"study", "effect", "ci_lower", "ci_upper"\}\
-        if not required_cols.issubset(set(eff_df.columns)):\
-            st.error(f"CSV \uc0\u38656 \u21253 \u21547 \u27396 \u20301 \u65306 \{required_cols\}")\
-        else:\
-            st.subheader("\uc0\u19978 \u20659 \u30340 \u36039 \u26009 ")\
-            st.dataframe(eff_df, use_container_width=True)\
-\
-            effects = eff_df["effect"].tolist()\
-            lowers = eff_df["ci_lower"].tolist()\
-            uppers = eff_df["ci_upper"].tolist()\
-\
-            weights = []\
-            for eff, lo, up in zip(effects, lowers, uppers):\
-                se = (up - lo) / (2 * 1.96)\
-                if se <= 0:\
-                    se = 1e-6\
-                weights.append(1.0 / (se ** 2))\
-\
-            num = sum(w * e for w, e in zip(weights, effects))\
-            den = sum(weights)\
-            pooled_effect = num / den if den > 0 else float("nan")\
-            pooled_var = 1.0 / den if den > 0 else float("nan")\
-            pooled_se = math.sqrt(pooled_var) if pooled_var > 0 else float("nan")\
-            pooled_ci_lower = pooled_effect - 1.96 * pooled_se\
-            pooled_ci_upper = pooled_effect + 1.96 * pooled_se\
-\
-            st.subheader("Fixed-effect pooled effect")\
-            st.write(\
-                f"Effect = \{pooled_effect:.3f\} "\
-                f"(95% CI \{pooled_ci_lower:.3f\} ~ \{pooled_ci_upper:.3f\})"\
-            )\
-\
-            st.write(\
-                "\uc0\u20043 \u24460 \u33509 \u22312 \u26412 \u27231 \u25110  lab server \u19978 \u37096 \u32626 \u65292 \u21487 \u20197 \u22312 \u36889 \u19968 \u27573 \u21152 \u19978  matplotlib / plotly \u30059 \u26862 \u26519 \u22294 \u65292 "\
-                "\uc0\u20006 \u25509 \u19978  full-text parser \u20570 \u33258 \u21205  extract\u12290 "\
-            )\
-}
+import streamlit as st
+import requests
+import pandas as pd
+from xml.etree import ElementTree as ET
+from typing import Dict
+
+NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+NCBI_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+
+st.set_page_config(page_title="Ophthalmology SRMA Prototype", layout="wide")
+
+
+# ---------------------------------------------------------
+# 小工具：把一個 term 變成 (term[tiab] OR "term"[MeSH Terms])
+# 若使用者自己打了 [MeSH] 或 [tiab] 就不再加工，直接使用原字串
+# ---------------------------------------------------------
+def build_mesh_block(term: str) -> str:
+    term = term.strip()
+    if not term:
+        return ""
+    lowered = term.lower()
+    # 若已經含有欄位語法，尊重使用者
+    if "[" in lowered and "]" in lowered:
+        return term
+    # 否則幫他做 TIAB+MeSH 同步搜尋
+    return f'({term}[tiab] OR "{term}"[MeSH Terms])'
+
+
+# ---------------------------------------------------------
+# Task 1. PICO 輸入 ＋ Query 建構（PICO 可留空，含 NOT 排除 + MeSH 同步）
+# ---------------------------------------------------------
+def task_1_pico_input():
+    st.header("Step 1. 定義 PICO ＋ 搜尋式（欄位可留空）")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        P_raw = st.text_input("P (Population)", "")
+        I_raw = st.text_input("I (Intervention)", "")
+    with col2:
+        C_raw = st.text_input("C (Comparison)", "")
+        O_raw = st.text_input("O (Outcome)", "")
+
+    # 排除條件（NOT）—這裡先用原字串，不幫你做 MeSH 展開
+    exclude_terms = st.text_input(
+        "排除關鍵字（NOT，例：pediatric OR animal OR case report）",
+        "",
+        help="這裡輸入的關鍵字會以 NOT (...) 的形式加入 PubMed 搜尋式，用來排除特定族群或研究類型。可留空。"
+    )
+
+    extra_raw = st.text_input("額外關鍵字 / 限制（例：specific device name，可留空）")
+    add_rct = st.checkbox("自動加入 RCT 關鍵字", value=True)
+    retmax = st.slider("抓取文獻數量 (records identified)", 10, 200, 50)
+
+    # ====== 把有填的 PICO 都轉成「TIAB + MeSH」block ======
+    include_parts = []
+    if P_raw:
+        include_parts.append(build_mesh_block(P_raw))
+    if I_raw:
+        include_parts.append(build_mesh_block(I_raw))
+    if C_raw:
+        include_parts.append(build_mesh_block(C_raw))
+    if O_raw:
+        include_parts.append(build_mesh_block(O_raw))
+    if extra_raw:
+        include_parts.append(build_mesh_block(extra_raw))
+    if add_rct:
+        include_parts.append(
+            '(randomized controlled trial[tiab] OR "Randomized Controlled Trial"[Publication Type])'
+        )
+
+    base_query = " AND ".join(include_parts) if include_parts else ""
+
+    # 再用 NOT 把排除條件接進去
+    if exclude_terms.strip():
+        if base_query:
+            query = f"({base_query}) NOT ({exclude_terms})"
+        else:
+            query = f"NOT ({exclude_terms})"
+    else:
+        query = base_query
+
+    st.subheader("自動產生的 PubMed Query（已含 MeSH 同步，可手動微調）")
+    query = st.text_area("PubMed Query", query, height=120)
+
+    # 把原始文字版 PICO 存進 pico dict（給 AI 和匯出用）
+    pico = {"P": P_raw, "I": I_raw, "C": C_raw, "O": O_raw, "X": exclude_terms}
+    return pico, query, retmax
+
+
+# ---------------------------------------------------------
+# Task 2. PubMed 抓取與整理（含 First author + DOI）
+# ---------------------------------------------------------
+def task_2_pubmed_fetch(query: str, retmax: int) -> pd.DataFrame:
+    if not query.strip():
+        return pd.DataFrame()
+
+    params = {
+        "db": "pubmed",
+        "term": query,
+        "retmode": "json",
+        "retmax": retmax,
+    }
+    r = requests.get(NCBI_ESEARCH, params=params, timeout=30)
+    r.raise_for_status()
+    idlist = r.json().get("esearchresult", {}).get("idlist", [])
+    if not idlist:
+        return pd.DataFrame()
+
+    fetch_params = {
+        "db": "pubmed",
+        "id": ",".join(idlist),
+        "retmode": "xml",
+    }
+    r = requests.get(NCBI_EFETCH, params=fetch_params, timeout=60)
+    r.raise_for_status()
+
+    root = ET.fromstring(r.text)
+    records = []
+
+    for article in root.findall(".//PubmedArticle"):
+        pmid = article.findtext(".//PMID", "")
+        title = article.findtext(".//ArticleTitle", "")
+
+        # 多段 AbstractText 接在一起
+        ab_parts = []
+        for ab in article.findall(".//AbstractText"):
+            if ab.text:
+                ab_parts.append(ab.text)
+        abstract = " ".join(ab_parts)
+
+        year = article.findtext(".//PubDate/Year", "")
+
+        # First author
+        first_author = ""
+        author = article.find(".//AuthorList/Author[1]")
+        if author is not None:
+            last = author.findtext("LastName", "")
+            initials = author.findtext("Initials", "")
+            if last and initials:
+                first_author = f"{last} {initials}"
+            else:
+                first_author = last or initials
+
+        # DOI
+        doi = ""
+        for aid in article.findall(".//ArticleIdList/ArticleId"):
+            if aid.get("IdType") == "doi" and aid.text:
+                doi = aid.text.strip()
+                break
+
+        records.append(
+            {
+                "pmid": pmid,
+                "doi": doi,
+                "title": title,
+                "abstract": abstract,
+                "year": year,
+                "first_author": first_author,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------
+# Task 4. AI 初篩（依 PICO 推論 Include/Exclude/Unsure，PICO 可部分留空）
+# ---------------------------------------------------------
+def count_match(text_low: str, term: str) -> int:
+    if not term:
+        return 0
+    words = [w.strip().lower() for w in term.split() if w.strip()]
+    return sum(1 for w in words if w in text_low)
+
+
+def ai_screen_single(row: pd.Series, pico: Dict) -> Dict:
+    """
+    很粗略的 rule-based 初篩：
+    - 只對「實際有填的 P/I/C/O」做比對
+    - 若全部 P/I/C/O 都空白，就不下判斷，標成 Unsure
+    """
+    title = row.get("title", "") or ""
+    abstract = row.get("abstract", "") or ""
+    text = (title + " " + abstract).lower()
+
+    P = pico.get("P", "") or ""
+    I = pico.get("I", "") or ""
+    C = pico.get("C", "") or ""
+    O = pico.get("O", "") or ""
+    X = pico.get("X", "") or ""
+
+    # 計算每一項是否命中
+    p_hit = count_match(text, P)
+    i_hit = count_match(text, I)
+    c_hit = count_match(text, C)
+    o_hit = count_match(text, O)
+    x_hit = count_match(text, X) if X else 0
+
+    # 只把「有填」的 P/I/C/O 納入分母
+    non_empty_keys = [k for k, v in [("P", P), ("I", I), ("C", C), ("O", O)] if v]
+    denom = len(non_empty_keys)
+
+    hits = {
+        "P": bool(p_hit),
+        "I": bool(i_hit),
+        "C": bool(c_hit),
+        "O": bool(o_hit),
+    }
+    total_score = sum(1 for k in non_empty_keys if hits[k])
+
+    # 判斷 study 是否像 trial（非常粗略）
+    is_trial = any(k in text for k in ["randomized", "randomised", "trial", "prospective"])
+
+    # 若完全沒有提供 PICO，也沒有排除條件，就不要太有意見，直接 Unsure
+    if denom == 0 and not X:
+        label = "Unsure"
+    else:
+        ratio = total_score / denom if denom > 0 else 0.0
+        # Label 邏輯：若明顯 hit 到排除條件，可偏向 Exclude
+        if X and x_hit:
+            label = "Exclude"
+        else:
+            if ratio >= 0.75 and is_trial:
+                label = "Include"
+            elif ratio <= 0.25 and not is_trial:
+                label = "Exclude"
+            else:
+                label = "Unsure"
+
+    # 組中文理由
+    reason_parts = []
+    if P:
+        reason_parts.append(
+            f"P（{P}）" + ("有在標題/摘要中出現" if p_hit else "在標題/摘要中較少被明確提到")
+        )
+    if I:
+        reason_parts.append(
+            f"I（{I}）" + ("有明顯相關描述" if i_hit else "未明確符合介入描述")
+        )
+    if C:
+        reason_parts.append(
+            f"C（{C}）" + ("似乎有提到比較對象" if c_hit else "比較對象不清楚或未提及")
+        )
+    if O:
+        reason_parts.append(
+            f"O（{O}）" + ("有提到相關 outcome" if o_hit else "未明確描述該 outcome")
+        )
+    if X:
+        reason_parts.append(
+            f"排除關鍵字（{X}）" + ("似乎有在摘要中出現，偏向排除" if x_hit else "未明顯觸及排除條件")
+        )
+
+    if not non_empty_keys and not X:
+        reason_parts.append("未提供明確 PICO，AI 只做非常粗略的判斷，建議人工檢視。")
+    if is_trial:
+        reason_parts.append("摘要中有 randomized / trial 等字樣，較像介入性研究")
+
+    reason_text = "；".join(reason_parts) if reason_parts else "依 PICO 無法判斷，建議人工檢視全文。"
+
+    # confidence 用「命中比例」，若 denom=0 則設為 0.0
+    confidence = round((total_score / denom) if denom > 0 else 0.0, 2)
+
+    alignment = {
+        "P": hits["P"],
+        "I": hits["I"],
+        "C": hits["C"],
+        "O": hits["O"],
+    }
+
+    return {
+        "label": label,
+        "reason": reason_text,
+        "alignment": alignment,
+        "confidence": confidence,
+    }
+
+
+def run_ai_for_all(df: pd.DataFrame, pico: Dict):
+    if "ai_results" not in st.session_state:
+        st.session_state.ai_results = {}
+    if "decisions" not in st.session_state:
+        st.session_state.decisions = {}
+    if "fulltext_decisions" not in st.session_state:
+        st.session_state.fulltext_decisions = {}
+    if "fulltext_reasons" not in st.session_state:
+        st.session_state.fulltext_reasons = {}
+
+    for _, row in df.iterrows():
+        pmid = row["pmid"]
+        res = ai_screen_single(row, pico)
+        st.session_state.ai_results[pmid] = res
+        # title/abstract 預設人工決策 = AI 建議（可在 UI 再改）
+        st.session_state.decisions.setdefault(pmid, res["label"])
+        # full-text 預設 = Not reviewed yet
+        st.session_state.fulltext_decisions.setdefault(pmid, "Not reviewed yet")
+        st.session_state.fulltext_reasons.setdefault(pmid, "")
+
+
+# ---------------------------------------------------------
+# Task 3. 篩選 UI：顯示 AI 建議 + 理由 + 人工覆寫 + full-text 回報
+# ---------------------------------------------------------
+def task_3_screening_ui(df: pd.DataFrame):
+    st.header("Step 3. 逐篇 screening：AI 建議 + 人工覆寫 + Full-text 回報")
+
+    if "decisions" not in st.session_state:
+        st.session_state.decisions = {}
+    if "ai_results" not in st.session_state:
+        st.session_state.ai_results = {}
+    if "fulltext_decisions" not in st.session_state:
+        st.session_state.fulltext_decisions = {}
+    if "fulltext_reasons" not in st.session_state:
+        st.session_state.fulltext_reasons = {}
+
+    # 總覽表
+    st.subheader("總覽表（含 AI 建議）")
+    overview_rows = []
+    for _, row in df.iterrows():
+        pmid = row["pmid"]
+        ai_res = st.session_state.ai_results.get(pmid, {})
+        ai_label = ai_res.get("label", "未預測")
+        ai_conf = ai_res.get("confidence", None)
+        overview_rows.append(
+            {
+                "pmid": pmid,
+                "doi": row.get("doi", ""),
+                "first_author": row.get("first_author", ""),
+                "year": row["year"],
+                "title": row["title"][:80] + ("..." if len(row["title"]) > 80 else ""),
+                "AI_label": ai_label,
+                "AI_confidence": ai_conf,
+                "TA_decision": st.session_state.decisions.get(pmid, ai_label),
+                "FT_decision": st.session_state.fulltext_decisions.get(pmid, "Not reviewed yet"),
+            }
+        )
+    st.dataframe(pd.DataFrame(overview_rows), use_container_width=True)
+
+    st.markdown("---")
+
+    # 逐篇卡片
+    for _, row in df.iterrows():
+        pmid = row["pmid"]
+        title = row["title"]
+        abstract = row["abstract"]
+        year = row["year"]
+        first_author = row.get("first_author", "")
+        doi = row.get("doi", "")
+
+        ai_res = st.session_state.ai_results.get(pmid, None)
+        ai_label = ai_res["label"] if ai_res else "未預測"
+        ai_reason = ai_res["reason"] if ai_res else "（尚未產生 AI 理由）"
+        ai_conf = ai_res["confidence"] if ai_res else None
+
+        with st.expander(f"{title}", expanded=False):
+            st.markdown(
+                f"**PMID:** {pmid}　　**DOI:** {doi}　　**First author:** {first_author}　　**Year:** {year}"
+            )
+            st.markdown(
+                f"**AI 初篩建議：{ai_label}**"
+                + (f"（信心度 {ai_conf}）" if ai_conf is not None else "")
+            )
+            st.caption(f"理由：{ai_reason}")
+
+            st.markdown("**Abstract**")
+            st.write(abstract if abstract else "_No abstract available._")
+
+            # ---- Title / Abstract 決策 ----
+            current = st.session_state.decisions.get(pmid, ai_label)
+            options = ["Include", "Exclude", "Unsure"]
+            if current not in options:
+                current = "Unsure"
+            decision = st.radio(
+                "你的 title/abstract 判斷（可覆寫 AI 建議）",
+                options,
+                index=options.index(current),
+                key=f"human_decision_{pmid}",
+            )
+            st.session_state.decisions[pmid] = decision
+
+            st.markdown("---")
+
+            # ---- Full-text 決策 & 原因／摘要（由你看完全文後回填）----
+            ft_opts = [
+                "Not reviewed yet",
+                "Include for meta-analysis",
+                "Exclude after full-text",
+            ]
+            current_ft = st.session_state.fulltext_decisions.get(pmid, "Not reviewed yet")
+            if current_ft not in ft_opts:
+                current_ft = "Not reviewed yet"
+
+            ft_dec = st.radio(
+                "Full-text decision（看完全文後再回填，現在可先跳過）",
+                ft_opts,
+                index=ft_opts.index(current_ft),
+                key=f"ft_decision_{pmid}",
+            )
+            st.session_state.fulltext_decisions[pmid] = ft_dec
+
+            ft_reason = st.text_area(
+                "Full-text reason / notes（例如：樣本數太小、錯誤族群、不同介入等）",
+                value=st.session_state.fulltext_reasons.get(pmid, ""),
+                key=f"ft_reason_{pmid}",
+            )
+            st.session_state.fulltext_reasons[pmid] = ft_reason
+
+
+# ---------------------------------------------------------
+# Task 6. PRISMA 數字（簡化版）
+# ---------------------------------------------------------
+def task_6_prisma_summary(df: pd.DataFrame):
+    st.header("Step 4. 簡化版 PRISMA 數字")
+
+    identified = len(df)
+    after_dedup = len(df)  # 未實作去重，先當作相同
+
+    include_ta = sum(1 for v in st.session_state.decisions.values() if v == "Include")
+    exclude_ta = sum(1 for v in st.session_state.decisions.values() if v == "Exclude")
+    unsure_ta = sum(1 for v in st.session_state.decisions.values() if v == "Unsure")
+
+    include_ft = sum(
+        1
+        for v in st.session_state.fulltext_decisions.values()
+        if v == "Include for meta-analysis"
+    )
+    exclude_ft = sum(
+        1
+        for v in st.session_state.fulltext_decisions.values()
+        if v == "Exclude after full-text"
+    )
+
+    st.write(f"Records identified（esearch 回傳）：**{identified}**")
+    st.write(f"Records after duplicates removed：**{after_dedup}**")
+    st.write(f"Included for full-text review（依 title/abstract）：**{include_ta}**")
+    st.write(f"Unsure（待確認 full-text）：**{unsure_ta}**")
+    st.write(f"Excluded at title/abstract screening：**{exclude_ta}**")
+    st.write(f"Included in meta-analysis（full-text 決策）：**{include_ft}**")
+    st.write(f"Excluded after full-text：**{exclude_ft}**")
+
+
+# ---------------------------------------------------------
+# Task 5. 匯出清單
+#   A. screening summary（含 PICO/AI/TA/FT + PMID/DOI）
+#   B. excluded_title_abstract（給 PRISMA 排除清單）
+#   C. extraction-style table（欄位近似你貼的 Excel，含 FT 決策＆理由）
+# ---------------------------------------------------------
+def task_5_export_tables(df: pd.DataFrame, pico: Dict):
+    st.header("Step 5. 匯出清單（含 PICO & 資料萃取表）")
+
+    if "ai_results" not in st.session_state or not st.session_state.ai_results:
+        st.info("請先在 Step 2 執行 AI 初篩後再匯出。")
+        return
+
+    # ---------- 5A. Screening summary（全部文章） ----------
+    screen_rows = []
+    for _, row in df.iterrows():
+        pmid = row["pmid"]
+        ai_res = st.session_state.ai_results.get(pmid, {})
+        align = ai_res.get("alignment", {}) or {}
+        ta_human = st.session_state.decisions.get(pmid, "")
+        ft_dec = st.session_state.fulltext_decisions.get(pmid, "Not reviewed yet")
+        ft_reason = st.session_state.fulltext_reasons.get(pmid, "")
+
+        screen_rows.append(
+            {
+                "pmid": pmid,
+                "doi": row.get("doi", ""),
+                "first_author": row.get("first_author", ""),
+                "year": row["year"],
+                "title": row["title"],
+                "P_query": pico.get("P", ""),
+                "I_query": pico.get("I", ""),
+                "C_query": pico.get("C", ""),
+                "O_query": pico.get("O", ""),
+                "X_query": pico.get("X", ""),
+                "P_match": align.get("P", False),
+                "I_match": align.get("I", False),
+                "C_match": align.get("C", False),
+                "O_match": align.get("O", False),
+                "AI_label": ai_res.get("label", ""),
+                "AI_confidence": ai_res.get("confidence", None),
+                "AI_reason": ai_res.get("reason", ""),
+                "TA_decision": ta_human,
+                "FT_decision": ft_dec,
+                "FT_reason": ft_reason,
+            }
+        )
+    screening_df = pd.DataFrame(screen_rows)
+
+    st.subheader("5A. screening summary 預覽（全部文章）")
+    st.dataframe(screening_df, use_container_width=True)
+
+    csv_screen = screening_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "下載 screening summary CSV（含 PICO / AI / TA / full-text 決策）",
+        data=csv_screen,
+        file_name="srma_screening_summary.csv",
+        mime="text/csv",
+    )
+
+    # ---------- 5A-1. 只看「title/abstract 被排除」的文章清單 ----------
+    excluded_df = screening_df[screening_df["TA_decision"] == "Exclude"].copy()
+
+    if not excluded_df.empty:
+        st.subheader("5A-1. Title/abstract 被排除文章清單")
+        show_cols = [
+            "pmid",
+            "doi",
+            "first_author",
+            "year",
+            "title",
+            "AI_label",
+            "AI_reason",
+            "TA_decision",
+        ]
+        st.dataframe(excluded_df[show_cols], use_container_width=True)
+
+        csv_excluded = excluded_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "下載『被排除文章＋AI 理由』CSV（給 PRISMA 附錄用）",
+            data=csv_excluded,
+            file_name="srma_excluded_title_abstract.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("目前沒有被標記為 Exclude 的文章。")
+
+    st.markdown("---")
+
+    # ---------- 5B. Data extraction 模板 ----------
+    extract_rows = []
+    for _, row in df.iterrows():
+        pmid = row["pmid"]
+        ta_human = st.session_state.decisions.get(pmid, "")
+        ft_dec = st.session_state.fulltext_decisions.get(pmid, "Not reviewed yet")
+        ft_reason = st.session_state.fulltext_reasons.get(pmid, "")
+        ai_res = st.session_state.ai_results.get(pmid, {})
+
+        extract_rows.append(
+            {
+                "PMID": pmid,
+                "DOI": row.get("doi", ""),
+                "First author": row.get("first_author", ""),
+                "Year": row["year"],
+                "Country": "",
+                "Experimental": "",
+                "Sample size (Exp)": "",
+                "Controlled": "",
+                "Sample size (Ctrl)": "",
+                "Visual acuity testing eye condition": "",
+                "Follow-up": "",
+                "Outcomes": "",
+                # 輔助欄位
+                "Title": row["title"],
+                "P_query": pico.get("P", ""),
+                "I_query": pico.get("I", ""),
+                "C_query": pico.get("C", ""),
+                "O_query": pico.get("O", ""),
+                "X_query": pico.get("X", ""),
+                "AI_label": ai_res.get("label", ""),
+                "TA_decision": ta_human,
+                "FT_decision": ft_dec,
+                "FT_reason": ft_reason,
+            }
+        )
+    extraction_df = pd.DataFrame(extract_rows)
+
+    st.subheader("5B. Data extraction 表格預覽（可在 Excel 補完 Experimental / Outcomes 等欄位）")
+    st.dataframe(extraction_df, use_container_width=True)
+
+    csv_extract = extraction_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "下載 data extraction CSV（欄位如 SRMA 萃取表＋full-text 決策）",
+        data=csv_extract,
+        file_name="srma_data_extraction_template.csv",
+        mime="text/csv",
+    )
+
+
+# ---------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------
+st.title("眼科 SRMA 自動化 Prototype（PICO 可留空，含 MeSH 同步＋NOT＋AI 初篩＋full-text 回報＋萃取表匯出）")
+
+pico, query, retmax = task_1_pico_input()
+
+if st.button("Step 2. 抓 PubMed 文獻並執行 AI 初篩"):
+    with st.spinner("向 PubMed 抓取資料並進行 AI 初篩…"):
+        try:
+            df = task_2_pubmed_fetch(query, retmax)
+            if df.empty:
+                st.warning("沒有抓到任何文獻，可能是搜尋式太嚴格。")
+                st.session_state.df = None
+            else:
+                st.session_state.df = df
+                run_ai_for_all(df, pico)
+                st.success(f"抓到 {len(df)} 篇文獻，已完成 AI 初步建議與理由。")
+        except Exception as e:
+            st.session_state.df = None
+            st.error(f"抓取 PubMed 或解析時出錯：{e}")
+
+# 有資料時顯示後續步驟
+if "df" in st.session_state and isinstance(st.session_state.df, pd.DataFrame) and not st.session_state.df.empty:
+    df = st.session_state.df
+    task_3_screening_ui(df)
+    task_6_prisma_summary(df)
+    task_5_export_tables(df, pico)
+else:
+    st.info("請先完成 Step 2 抓取文獻。")
