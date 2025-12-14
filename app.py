@@ -1,11 +1,14 @@
 # =========================================================
-# SRMA Web App (Streamlit) - General-purpose SR/MA assistant
-# Key design goals:
-# - Minimal user input: default to P + I only for PubMed query generation
-# - C / O are advanced optional inputs (do NOT affect search unless user enables strict mode)
-# - Optional LLM (OpenAI-compatible) for feasibility + extraction
-# - Optional python-docx / matplotlib / PyPDF2 (app will not crash if missing)
-# - No credential storage: provide OpenURL/EZproxy links only
+# SRMA Web App (Streamlit) - v3 (Scope/Feasibility + Query Expander + Dynamic Extraction)
+# =========================================================
+# Design targets (per your lab requirements):
+# 1) Minimal user input: by default only P + I are needed.
+# 2) PubMed query auto-generation supports robust free-text expansion (synonyms, phrases, abbreviations)
+#    WITHOUT hardcoding ophthalmology-specific examples.
+# 3) Before any downstream steps: run "Existing SR/MA scan" + feasibility report (optionally LLM) to
+#    refine PICO, propose inclusion/exclusion, and propose extraction schema.
+# 4) Data extraction prompt explicitly instructs OCR and figure/table reading; leave blanks if not found.
+# 5) Extraction table is NOT hard-coded: user can edit schema; or let AI propose schema at PICO level.
 # =========================================================
 
 from __future__ import annotations
@@ -23,21 +26,19 @@ import requests
 import pandas as pd
 import streamlit as st
 
-# Optional: PDF text extraction
+# ---------------- Optional dependencies ----------------
 try:
     from PyPDF2 import PdfReader
     HAS_PYPDF2 = True
 except Exception:
     HAS_PYPDF2 = False
 
-# Optional: plotting
 try:
     import matplotlib.pyplot as plt
     HAS_MPL = True
 except Exception:
     HAS_MPL = False
 
-# Optional: Word export (python-docx)
 try:
     from docx import Document
     from docx.shared import Pt
@@ -46,35 +47,23 @@ try:
 except Exception:
     HAS_DOCX = False
 
-# --------------------- Page ---------------------
+# ---------------- Page ----------------
 st.set_page_config(page_title="SRMA", layout="wide")
 
-# --------------------- Basic UI CSS ---------------------
 CSS = """
 <style>
-.card {
-    border: 1px solid #dde2eb;
-    border-radius: 10px;
-    padding: 0.9rem 1rem;
-    margin-bottom: 0.9rem;
-    background-color: #ffffff;
-}
-.meta { font-size: 0.85rem; color: #444; }
-.badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px;
-         font-size: 0.78rem; margin-right: 0.35rem; border: 1px solid rgba(0,0,0,0.06); }
-.badge-include { background: #d1fae5; color: #065f46; }
-.badge-exclude { background: #fee2e2; color: #991b1b; }
-.badge-unsure  { background: #e0f2fe; color: #075985; }
-.small { font-size: 0.85rem; color: #666; }
-.kpi {
-    border: 1px solid #e5e7eb;
-    border-radius: 10px;
-    padding: 0.75rem 0.9rem;
-    background: #f9fafb;
-}
-.kpi .label { font-size: 0.8rem; color: #6b7280; }
-.kpi .value { font-size: 1.2rem; font-weight: 700; color: #111827; }
-hr.soft { border: none; border-top: 1px solid #eef2f7; margin: 0.8rem 0; }
+.card { border:1px solid #dde2eb; border-radius:10px; padding:0.9rem 1rem; margin-bottom:0.9rem; background:#fff; }
+.meta { font-size:0.85rem; color:#444; }
+.badge { display:inline-block; padding:0.15rem 0.55rem; border-radius:999px; font-size:0.78rem; margin-right:0.35rem; border:1px solid rgba(0,0,0,0.06); }
+.badge-include { background:#d1fae5; color:#065f46; }
+.badge-exclude { background:#fee2e2; color:#991b1b; }
+.badge-unsure  { background:#e0f2fe; color:#075985; }
+.small { font-size:0.85rem; color:#666; }
+.kpi { border:1px solid #e5e7eb; border-radius:10px; padding:0.75rem 0.9rem; background:#f9fafb; }
+.kpi .label { font-size:0.8rem; color:#6b7280; }
+.kpi .value { font-size:1.2rem; font-weight:700; color:#111827; }
+hr.soft { border:none; border-top:1px solid #eef2f7; margin:0.8rem 0; }
+.codebox { background:#0b1020; color:#e6edf3; border-radius:10px; padding:0.75rem 0.85rem; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono"; font-size:0.86rem; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -82,7 +71,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 st.title("SRMA")
 
 # =========================================================
-# [A] Optional access gate (prevent public abuse)
+# Access gate (optional)
 # =========================================================
 APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
 if APP_PASSWORD:
@@ -94,7 +83,7 @@ if APP_PASSWORD:
         st.stop()
 
 # =========================================================
-# [0] Helpers
+# Helpers
 # =========================================================
 def ensure_columns(df: pd.DataFrame, cols: List[str], default="") -> pd.DataFrame:
     for c in cols:
@@ -122,22 +111,6 @@ def short(s: str, n=120) -> str:
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
-def doi_to_url(doi: str) -> str:
-    doi = (doi or "").strip()
-    return f"https://doi.org/{doi}" if doi else ""
-
-def pubmed_url(pmid: str) -> str:
-    pmid = (pmid or "").strip().replace("PMID:", "").strip()
-    return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
-
-def pmc_url(pmcid: str) -> str:
-    pmcid = (pmcid or "").strip()
-    if not pmcid:
-        return ""
-    if not pmcid.upper().startswith("PMC"):
-        pmcid = "PMC" + pmcid
-    return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
-
 def badge_html(label: str) -> str:
     label = label or "Unsure"
     if label == "Include":
@@ -149,7 +122,6 @@ def badge_html(label: str) -> str:
     return f'<span class="{cls}">{label}</span>'
 
 def json_from_text(s: str) -> Optional[dict]:
-    """Best-effort parse JSON object from a messy LLM response."""
     if not s:
         return None
     s = s.strip()
@@ -165,16 +137,52 @@ def json_from_text(s: str) -> Optional[dict]:
             return None
     return None
 
+def has_advanced_syntax(term: str) -> bool:
+    low = (term or "").lower()
+    return any(x in low for x in [" or ", " and ", " not ", "[tiab]", "[mesh", "[mh]", "(", ")", "\"", ":", "adj", "next/"])
+
+def quote_if_needed(x: str) -> str:
+    x = (x or "").strip()
+    if not x:
+        return ""
+    if '"' in x:
+        return x  # assume user knows what they're doing
+    if re.search(r"\s|-|/|:", x):
+        return f'"{x}"'
+    return x
+
+def split_synonyms(s: str) -> List[str]:
+    """
+    Accept newline-separated or comma/semicolon-separated synonyms.
+    """
+    if not s:
+        return []
+    parts = []
+    for line in s.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # allow inline separators
+        for p in re.split(r"[;,]", line):
+            p = p.strip()
+            if p:
+                parts.append(p)
+    out, seen = [], set()
+    for p in parts:
+        p2 = p.strip()
+        if p2 and p2.lower() not in seen:
+            out.append(p2)
+            seen.add(p2.lower())
+    return out
+
 # =========================================================
-# [1] Institutional link helpers (resolver / ezproxy)
+# Institutional links (OpenURL/EZproxy) - no credential storage
 # =========================================================
 def build_openurl(resolver_base: str, doi: str = "", pmid: str = "", title: str = "") -> str:
     resolver_base = (resolver_base or "").strip()
     if not resolver_base:
         return ""
-    params = []
-    params.append("url_ver=Z39.88-2004")
-    params.append("ctx_ver=Z39.88-2004")
+    params = ["url_ver=Z39.88-2004", "ctx_ver=Z39.88-2004"]
     if doi:
         params.append("rft_id=" + requests.utils.quote(f"info:doi/{doi}"))
     elif pmid:
@@ -195,11 +203,27 @@ def apply_ezproxy(ezproxy_prefix: str, url: str) -> str:
         ezproxy_prefix = ezproxy_prefix[:-1]
     return ezproxy_prefix + "/login?url=" + requests.utils.quote(url, safe="")
 
+def doi_to_url(doi: str) -> str:
+    doi = (doi or "").strip()
+    return f"https://doi.org/{doi}" if doi else ""
+
+def pubmed_url(pmid: str) -> str:
+    pmid = (pmid or "").strip().replace("PMID:", "").strip()
+    return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
+
+def pmc_url(pmcid: str) -> str:
+    pmcid = (pmcid or "").strip()
+    if not pmcid:
+        return ""
+    if not pmcid.upper().startswith("PMC"):
+        pmcid = "PMC" + pmcid
+    return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
+
 # =========================================================
-# [2] MeSH suggestion sync (NLM MeSH lookup)
+# MeSH suggestion (optional)
 # =========================================================
 @st.cache_data(show_spinner=False, ttl=60*60)
-def mesh_suggest(term: str, limit: int = 6) -> List[str]:
+def mesh_suggest(term: str, limit: int = 8) -> List[str]:
     term = (term or "").strip()
     if not term:
         return []
@@ -214,35 +238,111 @@ def mesh_suggest(term: str, limit: int = 6) -> List[str]:
             lab = item.get("label")
             if lab:
                 labels.append(lab)
-        seen, out = set(), []
+        out, seen = [], set()
         for x in labels:
-            if x not in seen:
-                out.append(x); seen.add(x)
+            if x.lower() not in seen:
+                out.append(x); seen.add(x.lower())
         return out[:limit]
     except Exception:
         return []
 
-def build_pubmed_block(term: str, mesh_label: Optional[str] = None) -> str:
+# =========================================================
+# Query builder (key fix)
+# - default: P + I (+ Extra + NOT)
+# - no hardcoded domain examples
+# - robust free-text expansion via synonyms boxes
+# - RCT filter is OPTIONAL and off by default (you can turn it on)
+# =========================================================
+def build_concept_group(
+    term: str,
+    mesh_label: str,
+    synonyms_text: str,
+    field_tag: str = "tiab",
+    allow_mesh: bool = True
+) -> str:
     """
-    Create a PubMed boolean block.
-    If user already wrote advanced syntax (OR/AND/NOT/brackets/field tags), treat as raw block.
+    Build: (term[tiab] OR "syn 1"[tiab] OR ... OR "MeSH label"[MeSH Terms])
+    If user used advanced syntax, return as-is.
     """
     term = (term or "").strip()
-    if not term:
+    mesh_label = (mesh_label or "").strip()
+    syns = split_synonyms(synonyms_text or "")
+
+    if not term and not syns and not mesh_label:
         return ""
-    low = term.lower()
 
-    # Heuristic: if user typed boolean logic or field tags, do not rewrite.
-    if any(x in low for x in [" or ", " and ", " not ", "[tiab]", "[mesh", "[mh]", "(", ")", "\""]):
-        return term
+    # Advanced syntax => pass through (do not rewrite).
+    if term and has_advanced_syntax(term):
+        return f"({term})"
 
-    if mesh_label and mesh_label.strip():
-        mesh_label = mesh_label.strip()
-        return f'({term}[tiab] OR "{mesh_label}"[MeSH Terms])'
-    return f'({term}[tiab] OR "{term}"[MeSH Terms])'
+    free_terms = []
+    if term:
+        free_terms.append(term)
+    free_terms.extend([s for s in syns if s])
+
+    # Build free-text ORs
+    free_blocks = []
+    for t in free_terms:
+        if not t:
+            continue
+        if has_advanced_syntax(t):
+            free_blocks.append(t)
+        else:
+            free_blocks.append(f"{quote_if_needed(t)}[{field_tag}]")
+
+    # MeSH
+    mesh_block = ""
+    if allow_mesh and mesh_label:
+        mesh_block = f'{quote_if_needed(mesh_label)}[MeSH Terms]'
+
+    blocks = []
+    if free_blocks:
+        blocks.append(" OR ".join(free_blocks))
+    if mesh_block:
+        blocks.append(mesh_block)
+
+    if not blocks:
+        return ""
+    if len(blocks) == 1:
+        return f"({blocks[0]})"
+    return f"(({blocks[0]}) OR ({blocks[1]}))"
+
+def build_pubmed_query(pico: Dict[str, str], mesh: Dict[str, str], syns: Dict[str, str],
+                       include_CO: bool, include_rct_filter: bool) -> str:
+    """
+    Default minimal: P + I only
+    """
+    parts = []
+    if pico.get("P","").strip() or syns.get("P","").strip() or mesh.get("P","").strip():
+        parts.append(build_concept_group(pico.get("P",""), mesh.get("P",""), syns.get("P","")))
+    if pico.get("I","").strip() or syns.get("I","").strip() or mesh.get("I","").strip():
+        parts.append(build_concept_group(pico.get("I",""), mesh.get("I",""), syns.get("I","")))
+    if include_CO:
+        if pico.get("C","").strip() or syns.get("C","").strip() or mesh.get("C","").strip():
+            parts.append(build_concept_group(pico.get("C",""), mesh.get("C",""), syns.get("C","")))
+        if pico.get("O","").strip() or syns.get("O","").strip() or mesh.get("O","").strip():
+            parts.append(build_concept_group(pico.get("O",""), mesh.get("O",""), syns.get("O","")))
+    if pico.get("EXTRA","").strip() or syns.get("EXTRA","").strip() or mesh.get("EXTRA","").strip():
+        # Extra is treated as free text only by default; mesh optionally
+        parts.append(build_concept_group(pico.get("EXTRA",""), mesh.get("EXTRA",""), syns.get("EXTRA",""), allow_mesh=True))
+
+    base = " AND ".join([p for p in parts if p]).strip()
+    if not base:
+        return ""
+
+    if include_rct_filter:
+        rct = '(randomized controlled trial[pt] OR randomized[tiab] OR randomised[tiab] OR trial[tiab] OR placebo[tiab])'
+        base = f"({base}) AND ({rct})"
+    else:
+        base = f"({base})"
+
+    not_block = (pico.get("X","") or "").strip()
+    if not_block:
+        return f"{base} NOT ({not_block})"
+    return base
 
 # =========================================================
-# [3] PubMed / ClinicalTrials.gov fetchers
+# PubMed fetchers
 # =========================================================
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_EFETCH  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -326,8 +426,6 @@ def fetch_pubmed(query: str, max_records: int = 0, batch_size: int = 200, polite
         all_ids.extend(ids)
         if polite_delay > 0:
             time.sleep(polite_delay)
-        if "pubmed_progress" in st.session_state:
-            st.session_state.pubmed_progress.progress(min(1.0, len(all_ids) / max(target, 1)))
 
     rows = []
     for i in range(0, len(all_ids), batch_size):
@@ -338,8 +436,6 @@ def fetch_pubmed(query: str, max_records: int = 0, batch_size: int = 200, polite
             rows.append(df)
         if polite_delay > 0:
             time.sleep(polite_delay)
-        if "pubmed_fetch_progress" in st.session_state:
-            st.session_state.pubmed_fetch_progress.progress(min(1.0, (i+len(chunk)) / max(len(all_ids), 1)))
 
     if not rows:
         return pd.DataFrame(), count
@@ -347,45 +443,56 @@ def fetch_pubmed(query: str, max_records: int = 0, batch_size: int = 200, polite
     out = ensure_columns(out, ["record_id","pmid","pmcid","doi","title","abstract","year","first_author","journal","source","url","doi_url","pmc_url"], default="")
     return out, count
 
-def fetch_ctgov(query: str, max_records: int = 200) -> pd.DataFrame:
+# =========================================================
+# Crossref fetch (optional database, free API)
+# =========================================================
+@st.cache_data(show_spinner=False, ttl=60*30)
+def crossref_search(query: str, rows: int = 50) -> pd.DataFrame:
     query = (query or "").strip()
-    if not query or max_records <= 0:
+    if not query:
         return pd.DataFrame()
-    fields = ["NCTId","BriefTitle","BriefSummary","StartDate","StudyType","Condition"]
-    url = "https://clinicaltrials.gov/api/query/study_fields"
-    params = {"expr": query, "fields": ",".join(fields), "min_rnk": 1, "max_rnk": int(max_records), "fmt":"json"}
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    studies = r.json().get("StudyFieldsResponse", {}).get("StudyFields", []) or []
-    out = []
-    for stf in studies:
-        def first(k):
-            v = stf.get(k, [])
-            return v[0] if v else ""
-        nct = first("NCTId")
-        title = first("BriefTitle")
-        abstract = first("BriefSummary")
-        start = first("StartDate")
-        year = start.split()[-1] if start else ""
-        rid = f"NCT:{nct}" if nct else f"NCT:IDX:{len(out)}"
-        url2 = f"https://clinicaltrials.gov/study/{nct}" if nct else ""
-        out.append({
-            "record_id": rid,
-            "pmid": "",
-            "pmcid": "",
-            "doi": "",
-            "title": norm_text(title),
-            "abstract": norm_text(abstract),
-            "year": year,
-            "first_author": "",
-            "journal": "",
-            "source": "ClinicalTrials.gov",
-            "url": url2,
-            "doi_url": "",
-            "pmc_url": "",
-        })
-    df = pd.DataFrame(out)
-    return ensure_columns(df, ["record_id","pmid","pmcid","doi","title","abstract","year","first_author","journal","source","url","doi_url","pmc_url"], default="")
+    url = "https://api.crossref.org/works"
+    params = {"query.bibliographic": query, "rows": int(rows)}
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        items = r.json().get("message", {}).get("items", []) or []
+        out = []
+        for it in items:
+            doi = (it.get("DOI") or "").strip()
+            title = ""
+            tlist = it.get("title") or []
+            if tlist:
+                title = norm_text(tlist[0])
+            year = ""
+            issued = it.get("issued", {}).get("date-parts", [])
+            if issued and issued[0]:
+                year = str(issued[0][0])
+            authors = it.get("author") or []
+            first_author = ""
+            if authors:
+                a0 = authors[0]
+                first_author = (a0.get("family","") + " " + (a0.get("given","")[:1] if a0.get("given") else "")).strip()
+            abstract = norm_text(it.get("abstract","") or "")
+            out.append({
+                "record_id": f"DOI:{doi}" if doi else f"Crossref:{len(out)}",
+                "pmid": "",
+                "pmcid": "",
+                "doi": doi,
+                "title": title,
+                "abstract": abstract,
+                "year": year,
+                "first_author": first_author,
+                "journal": norm_text((it.get("container-title") or [""])[0]),
+                "source": "Crossref",
+                "url": doi_to_url(doi),
+                "doi_url": doi_to_url(doi),
+                "pmc_url": "",
+            })
+        df = pd.DataFrame(out)
+        return ensure_columns(df, ["record_id","pmid","pmcid","doi","title","abstract","year","first_author","journal","source","url","doi_url","pmc_url"], default="")
+    except Exception:
+        return pd.DataFrame()
 
 def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -398,7 +505,7 @@ def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 # =========================================================
-# [4] LLM (OpenAI-compatible) - optional
+# LLM (OpenAI-compatible) - optional
 # =========================================================
 def llm_available() -> bool:
     api_key = (st.session_state.get("LLM_API_KEY") or "").strip()
@@ -407,9 +514,6 @@ def llm_available() -> bool:
     return bool(api_key and base and model)
 
 def llm_chat(messages: List[dict], temperature: float = 0.2, timeout: int = 90) -> Optional[str]:
-    """
-    OpenAI-compatible: POST {base}/v1/chat/completions
-    """
     base = (st.session_state.get("LLM_BASE_URL") or "").strip().rstrip("/")
     api_key = (st.session_state.get("LLM_API_KEY") or "").strip()
     model = (st.session_state.get("LLM_MODEL") or "").strip()
@@ -428,7 +532,7 @@ def llm_chat(messages: List[dict], temperature: float = 0.2, timeout: int = 90) 
         return None
 
 # =========================================================
-# [5] Rule-based AI screening (fallback, higher recall)
+# Rule-based TA screening (high recall)
 # =========================================================
 def _count_hits(text_low: str, term: str) -> int:
     term = (term or "").strip()
@@ -438,11 +542,6 @@ def _count_hits(text_low: str, term: str) -> int:
     return sum(1 for t in toks if t and t in text_low)
 
 def ai_screen_rule_based(row: pd.Series, pico: Dict[str,str]) -> Dict:
-    """
-    High-recall rule-based TA screening:
-    - Prefer to keep candidates (Include/Unsure) for later FT over-aggressive Exclude.
-    - Default uses P + I only (C/O not required).
-    """
     title = row.get("title","") or ""
     abstract = row.get("abstract","") or ""
     text = (title + " " + abstract).lower()
@@ -456,261 +555,255 @@ def ai_screen_rule_based(row: pd.Series, pico: Dict[str,str]) -> Dict:
     x_hit = _count_hits(text, X) if X else 0
 
     is_trial = any(w in text for w in ["randomized", "randomised", "trial", "controlled", "prospective", "double-blind", "single-blind"])
-    is_basic = any(w in text for w in ["in vitro", "cell line", "mouse", "mice", "rat", "animal model", "transcriptome", "proteomic", "pbmc"])
+    is_basic = any(w in text for w in ["in vitro", "cell line", "mouse", "mice", "rat", "animal model"])
     is_case_report = any(w in text for w in ["case report", "case series"])
 
-    # Hard excludes
     if X.strip() and x_hit:
-        label = "Exclude"
-        reason = "NOT keyword hit"
-        conf = 0.9
-        return {"label": label, "reason": reason, "confidence": conf, "rule_trace": "NOT"}
+        return {"label": "Exclude", "reason": "NOT keyword hit", "confidence": 0.9}
 
     if is_basic and not is_trial:
-        label = "Exclude"
-        reason = "Basic research likely (and not trial-like)"
-        conf = 0.8
-        return {"label": label, "reason": reason, "confidence": conf, "rule_trace": "basic"}
+        return {"label": "Exclude", "reason": "Basic research likely (and not trial-like)", "confidence": 0.8}
 
     if is_case_report and not is_trial:
-        label = "Exclude"
-        reason = "Case report/series likely (and not trial-like)"
-        conf = 0.8
-        return {"label": label, "reason": reason, "confidence": conf, "rule_trace": "case"}
+        return {"label": "Exclude", "reason": "Case report/series likely (and not trial-like)", "confidence": 0.8}
 
-    # Include if P+I both appear OR trial-like + one appears
     if (P.strip() and I.strip() and p_hit and i_hit) and (is_trial or len(text) > 0):
-        label = "Include"
-        reason = "P+I hit; candidate for full-text"
-        conf = 0.75
-        return {"label": label, "reason": reason, "confidence": conf, "rule_trace": "PI"}
+        return {"label": "Include", "reason": "P+I hit; candidate for full-text", "confidence": 0.75}
 
     if is_trial and ((P.strip() and p_hit) or (I.strip() and i_hit)):
-        label = "Include"
-        reason = "Trial-like + P or I hit; keep for FT"
-        conf = 0.7
-        return {"label": label, "reason": reason, "confidence": conf, "rule_trace": "trial+P/I"}
+        return {"label": "Include", "reason": "Trial-like + P or I hit; keep for FT", "confidence": 0.7}
 
-    # Otherwise: Unsure (do not over-exclude)
-    label = "Unsure"
-    reason = "Insufficient TA evidence; keep as unsure"
-    conf = 0.4
-    return {"label": label, "reason": reason, "confidence": conf, "rule_trace": "unsure"}
+    return {"label": "Unsure", "reason": "Insufficient TA evidence; keep as unsure", "confidence": 0.4}
 
 # =========================================================
-# [6] Feasibility scan + optional LLM feasibility report
+# Feasibility: Existing SR/MA scan + LLM feasibility report
 # =========================================================
-def quick_srma_scan(pubmed_query: str, top_n: int = 20) -> Dict:
+def srma_scan_pubmed(pubmed_query: str, top_n: int = 25) -> Dict:
     q = (pubmed_query or "").strip()
     if not q:
         return {"summary":"(未提供 query)", "hits": pd.DataFrame()}
-    sr_filter = '(systematic review[Publication Type] OR meta-analysis[Publication Type] OR "systematic review"[tiab] OR "meta analysis"[tiab] OR "network meta-analysis"[tiab])'
-    q_sr = f"({q}) AND {sr_filter}"
+    sr_filter = '(systematic review[pt] OR meta-analysis[pt] OR "systematic review"[tiab] OR "meta analysis"[tiab] OR "network meta-analysis"[tiab])'
+    q_sr = f"({q}) AND ({sr_filter})"
     try:
         ids, count = pubmed_esearch_ids(q_sr, 0, min(top_n, 50))
         df_hits = pd.DataFrame()
         if ids:
             xml = pubmed_efetch_xml(ids)
             df_hits = parse_pubmed_xml(xml)[["pmid","doi","pmcid","title","year","first_author","journal","url","doi_url","pmc_url"]]
-        summary = f"PubMed 疑似 SR/MA：count ≈ {count}；列出前 {min(len(ids), top_n)} 篇。"
+        summary = f"PubMed 既有 SR/MA 掃描：count≈{count}；列出前 {min(len(ids), top_n)} 篇。"
         return {"summary": summary, "hits": df_hits}
     except Exception as e:
         return {"summary": f"SR/MA 掃描失敗：{e}", "hits": pd.DataFrame()}
 
-def feasibility_report_llm(pico: Dict[str,str], goal_mode: str, clinical_context: str,
-                           srma_hits: pd.DataFrame, current_query: str) -> Dict:
+def feasibility_llm(pico: Dict[str,str], goal_mode: str, clinical_context: str, srma_hits: pd.DataFrame, pubmed_query: str) -> Dict:
     sr_list = []
     if isinstance(srma_hits, pd.DataFrame) and not srma_hits.empty:
-        for _, r in srma_hits.head(15).iterrows():
+        for _, r in srma_hits.head(20).iterrows():
             sr_list.append({"pmid": r.get("pmid",""), "year": r.get("year",""), "title": r.get("title","")})
-    sys = "You are a senior SR/MA methodologist. Produce rigorous, auditable outputs."
+
+    sys = "You are a senior SR/MA methodologist. Output ONLY valid JSON."
     user = {
-        "task": "Stage A feasibility + topic scoping + criteria + extraction schema planning",
-        "goal_mode": goal_mode,
+        "task": "Feasibility report BEFORE screening",
+        "goal_mode": goal_mode,  # Gap-fill fast vs rigorous scope
         "clinical_context": clinical_context,
         "input_pico": pico,
-        "current_pubmed_query": current_query,
-        "known_srma_hits": sr_list,
-        "requirements": [
-            "Draft inclusion/exclusion criteria as executable rules with IDs.",
-            "Propose dynamic extraction schema based on topic and typical RCT outcomes.",
-            "Suggest search strategy with MeSH + synonyms; ensure it is feasible and publishable.",
-            "Output strictly as JSON with keys: refined_pico, inclusion_rules, exclusion_rules, search_strategy, extraction_schema, rationale."
+        "current_pubmed_query": pubmed_query,
+        "existing_srma_hits": sr_list,
+        "required_outputs": {
+            "refined_topic_options": "3 options; rank by feasibility and novelty",
+            "recommended_pico": "one best PICO with justification",
+            "inclusion_criteria": "explicit rule list; separate mandatory vs optional",
+            "exclusion_criteria": "explicit rule list",
+            "recommended_search_expansion": "synonyms/phrases for each concept; keep general",
+            "recommended_extraction_schema": "base fields + outcomes; ensure typical primary/secondary RCT outcomes considered",
+            "notes_on_human_judgement": "where minimal human judgement is still needed"
+        },
+        "constraints": [
+            "Do not assume ophthalmology; keep suggestions topic-agnostic unless user context implies otherwise.",
+            "If goal_mode indicates 'Fast/feasible', prioritize narrower topic and higher publishability.",
+            "If goal_mode indicates 'Rigorous', prioritize comprehensive scope; be transparent about workload."
         ]
     }
-    messages = [{"role": "system", "content": sys},
-                {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
-    txt = llm_chat(messages, temperature=0.2, timeout=120)
+    messages = [{"role":"system","content":sys},{"role":"user","content":json.dumps(user, ensure_ascii=False)}]
+    txt = llm_chat(messages, temperature=0.2, timeout=140)
     js = json_from_text(txt or "")
     if not js:
-        return {"error": "LLM 回傳無法解析為 JSON。", "raw": txt or ""}
+        return {"error":"LLM 回傳無法解析 JSON", "raw": txt or ""}
     return js
 
 # =========================================================
-# [7] Extraction prompt template (OCR/table/figure aware)
+# Extraction prompt (OCR + table/figure)
 # =========================================================
-def build_extraction_prompt(schema: dict, pico: dict, criteria_text: str) -> str:
+def build_extraction_prompt(schema: dict, pico: dict, criteria_text: str, goal_mode: str) -> str:
     base_cols = schema.get("base_cols", [])
     outcomes = schema.get("outcomes", [])
     prompt = f"""
-[Task E] Full-text review + data extraction (SR/MA)
+You are performing systematic review full-text data extraction.
 
-OCR/figure/table instructions:
-1) If PDF text is empty or looks scanned (no selectable text), state "OCR REQUIRED" and instruct OCR, then proceed best-effort.
-2) Prioritize tables, figure legends, appendix/supplement.
-3) When extracting numeric values, include source location: page if known; otherwise table/figure number or section heading.
+Goal mode: {goal_mode}
 
-Inclusion/Exclusion criteria (for traceability):
-{criteria_text if criteria_text else "(No formal criteria provided; use P+I as primary guidance.)"}
+OCR / Figure / Table instructions (critical):
+- If text looks missing/garbled OR PDF is scanned: explicitly output "OCR REQUIRED" and state what to OCR.
+- When extracting outcomes, prioritize: tables, figure legends, supplementary appendix.
+- If a value is taken from a figure, state "from Figure X (approx.)" and capture axis units/timepoint.
+- Never fabricate numbers. If not found, leave the field empty and list where it might be (e.g., Table 2, Figure 3, appendix).
 
-Inputs:
+Inclusion/Exclusion criteria (traceable; follow as executable rules):
+{criteria_text if criteria_text else "(No formal criteria provided. Use P+I as primary guidance; be conservative and mark Unsure if unclear.)"}
+
+Topic PICO:
 P={pico.get("P","")}
 I={pico.get("I","")}
 C={pico.get("C","")}
 O={pico.get("O","")}
 NOT={pico.get("X","")}
 
-Extraction schema (do not invent; leave blank if not found):
+Extraction schema (do not change keys; leave blank if not reported):
 Base fields:
 {json.dumps(base_cols, ensure_ascii=False)}
 
 Outcome fields:
 {json.dumps(outcomes, ensure_ascii=False)}
 
-Also extract effect estimate if possible:
-- effect_measure: OR/RR/HR/MD/SMD/RD
+Effect estimates (if available):
+- effect_measure: OR/RR/HR/MD/SMD/RD/Other
 - effect, lower_CI, upper_CI, timepoint, unit
-If not possible, leave blank and state why.
+If multiple outcomes/timepoints exist, prioritize the primary outcome and main follow-up timepoint; note others in missing_notes.
 
-Output format: JSON with keys:
+Output JSON ONLY with keys:
 - fulltext_decision: "Include for meta-analysis" / "Exclude after full-text" / "Not reviewed yet"
-- fulltext_reason
-- extracted_fields: object mapping each schema field -> value (string)
-- meta: effect_measure/effect/lower_CI/upper_CI/timepoint/unit
-- missing_notes: list of what cannot be extracted and where to check (table/figure/page)
+- fulltext_reason: short reason
+- extracted_fields: object mapping field -> value (string)
+- meta: object {effect_measure,effect,lower_CI,upper_CI,timepoint,unit}
+- missing_notes: list of strings describing missing items + where to look (table/figure/page/section)
 """
     return prompt.strip()
 
 # =========================================================
-# [8] Session state
+# Session state
 # =========================================================
 def init_state():
     ss = st.session_state
+    ss.setdefault("GOAL_MODE", "Rigorous / comprehensive")
+    ss.setdefault("CTX", "")
+    ss.setdefault("P", "")
+    ss.setdefault("I", "")
+    ss.setdefault("C", "")
+    ss.setdefault("O", "")
+    ss.setdefault("X", "")
+    ss.setdefault("EXTRA", "")
+    ss.setdefault("STRICT_CO", False)
+    ss.setdefault("INCLUDE_RCT_FILTER", False)
+    ss.setdefault("AUTO_FOLLOW_QUERY", True)
+
+    ss.setdefault("P_MESH","")
+    ss.setdefault("I_MESH","")
+    ss.setdefault("C_MESH","")
+    ss.setdefault("O_MESH","")
+    ss.setdefault("EXTRA_MESH","")
+
+    ss.setdefault("P_SYNS","")
+    ss.setdefault("I_SYNS","")
+    ss.setdefault("C_SYNS","")
+    ss.setdefault("O_SYNS","")
+    ss.setdefault("EXTRA_SYNS","")
+
+    ss.setdefault("PUBMED_QUERY","")
+    ss.setdefault("criteria_text","")
+
+    ss.setdefault("feasibility", {"srma_summary":"", "srma_hits": pd.DataFrame(), "llm_json": None})
+
     ss.setdefault("records_df", pd.DataFrame())
     ss.setdefault("pubmed_total_count", 0)
     ss.setdefault("ai_ta_df", pd.DataFrame())
     ss.setdefault("ta_final", {})
-    ss.setdefault("criteria_text", "")
-    ss.setdefault("feasibility", {"summary":"", "hits": pd.DataFrame(), "llm_json": None})
     ss.setdefault("ft_decisions", {})
     ss.setdefault("ft_reasons", {})
     ss.setdefault("ft_text", {})
     ss.setdefault("ft_note", {})
     ss.setdefault("rob2", {})
     ss.setdefault("extract_wide_df", pd.DataFrame())
-    ss.setdefault("screen_cursor", 0)
-    ss.setdefault("AUTO_WORD_BYTES", b"")
-    ss.setdefault("AUTO_PRISMA", {})
-
-    # Search building controls
-    ss.setdefault("AUTO_FOLLOW", True)     # auto follow PICO/MeSH for query
-    ss.setdefault("STRICT_CO", False)      # whether to include C/O in query
 init_state()
 
 # =========================================================
-# [9] Sidebar settings (LLM + institutional resolver)
+# Sidebar settings
 # =========================================================
 with st.sidebar:
     st.subheader("設定")
-    st.markdown("**全文導向（不存帳密）**")
+
     resolver_base = st.text_input(
         "OpenURL / Link resolver base（例：https://resolver.xxx.edu/openurl?）",
         value=st.session_state.get("RESOLVER_BASE",""),
-        help="填機構 link resolver。每篇文獻會產生『全文連結』，使用者點了再自行登入下載。"
+        help="不存帳密；點全文連結後由使用者自行登入下載。"
     )
     ezproxy_prefix = st.text_input(
         "EZproxy prefix（可選；例：https://ezproxy.xxx.edu/login?url=）",
         value=st.session_state.get("EZPROXY",""),
-        help="若有 EZproxy，可填前綴。會把外部連結轉成 EZproxy 版本。"
+        help="若有 EZproxy，可將外部連結轉為 EZproxy 版本。"
     )
     st.session_state["RESOLVER_BASE"] = resolver_base
     st.session_state["EZPROXY"] = ezproxy_prefix
 
     st.markdown("---")
     st.markdown("**LLM（可選；OpenAI-compatible）**")
-    llm_base = st.text_input("Base URL（例：https://api.openai.com）", value=st.session_state.get("LLM_BASE_URL",""))
-    llm_key  = st.text_input("API Key", value=st.session_state.get("LLM_API_KEY",""), type="password")
-    llm_model= st.text_input("Model", value=st.session_state.get("LLM_MODEL",""))
-    st.session_state["LLM_BASE_URL"] = llm_base
-    st.session_state["LLM_API_KEY"] = llm_key
-    st.session_state["LLM_MODEL"] = llm_model
+    st.session_state["LLM_BASE_URL"] = st.text_input("Base URL", value=st.session_state.get("LLM_BASE_URL",""))
+    st.session_state["LLM_API_KEY"]  = st.text_input("API Key", value=st.session_state.get("LLM_API_KEY",""), type="password")
+    st.session_state["LLM_MODEL"]    = st.text_input("Model", value=st.session_state.get("LLM_MODEL",""))
 
     if llm_available():
-        st.success("LLM 已設定：可用於可行性報告/criteria/schema/更準確篩選/抽取")
+        st.success("LLM 已設定：可用於可行性報告/criteria/schema/更準確抽取")
     else:
-        st.info("未設定 LLM：將使用規則法（穩定、可跑大量）；5B 抽取將不可用")
+        st.info("未設定 LLM：仍可做檢索與規則法粗篩；可行性/抽取會較弱")
 
     st.markdown("---")
     if not HAS_DOCX:
-        st.warning("目前環境未安裝 python-docx：Word 匯出功能停用（App 不會因此掛掉）。")
+        st.warning("未安裝 python-docx：Word 匯出停用。")
     if not HAS_MPL:
-        st.warning("目前環境未安裝 matplotlib：森林圖功能停用。")
+        st.warning("未安裝 matplotlib：森林圖停用。")
     if not HAS_PYPDF2:
-        st.warning("目前環境未安裝 PyPDF2：PDF 抽字功能停用（可改用貼全文）。")
+        st.warning("未安裝 PyPDF2：PDF 抽字停用（可改貼全文）。")
 
 # =========================================================
-# [10] Step 1: PICO + MeSH + Query (P+I default)
+# Step 1: PICO + Search Strategy (minimal input)
 # =========================================================
-st.header("Step 1. 輸入 PICO（預設只需 P+I）+ MeSH 同步 + NOT")
+st.header("Step 1. 定義 PICO + 搜尋式（預設只需 P + I）")
 
-goal_mode = st.selectbox(
-    "Goal mode",
-    options=["Auto", "Fast / feasible", "Rigorous / comprehensive"],
-    index=["Auto","Fast / feasible","Rigorous / comprehensive"].index(st.session_state.get("GOAL","Auto"))
-)
-st.session_state["GOAL"] = goal_mode
+col1, col2 = st.columns([1,1])
+with col1:
+    goal_mode = st.selectbox("Goal mode", options=["Fast / feasible (gap-fill)", "Rigorous / comprehensive"], index=1)
+with col2:
+    clinical_context = st.text_area("Clinical context（可留空；用於可行性判斷，不會自動進搜尋式）", value=st.session_state.get("CTX",""), height=70)
 
-clinical_context = st.text_area(
-    "Clinical context / scenario（可留空；不會自動進搜尋式）",
-    value=st.session_state.get("CTX",""),
-    height=80
-)
+st.session_state["GOAL_MODE"] = goal_mode
 st.session_state["CTX"] = clinical_context
 
-# ---- Basic: P + I ----
-colA, colB = st.columns(2)
-with colA:
-    P = st.text_input("P (Population / Topic) 〔建議必填〕", value=st.session_state.get("P",""))
-with colB:
-    I = st.text_input("I (Intervention / Exposure) 〔建議必填〕", value=st.session_state.get("I",""))
+colP, colC = st.columns([1,1])
+with colP:
+    P = st.text_input("P (Population / Topic) 〔建議填〕", value=st.session_state.get("P",""))
+with colC:
+    C = st.text_input("C (Comparison) 〔可留白〕", value=st.session_state.get("C",""))
 
-# ---- Advanced: C / O optional ----
-with st.expander("進階（可選）：C / O（預設不影響 PubMed 搜尋式）", expanded=False):
-    colC1, colC2 = st.columns(2)
-    with colC1:
-        C = st.text_input("C (Comparison) — 可留白", value=st.session_state.get("C",""))
-    with colC2:
-        O = st.text_input("O (Outcome) — 可留白", value=st.session_state.get("O",""))
+colI, colO = st.columns([1,1])
+with colI:
+    I = st.text_input("I (Intervention / Exposure) 〔建議填〕", value=st.session_state.get("I",""))
+with colO:
+    O = st.text_input("O (Outcome) 〔可留白〕", value=st.session_state.get("O",""))
 
-strict_include_CO = st.checkbox(
-    "嚴格把 C / O 納入 PubMed 檢索（會降低召回率；僅在你確定 TA 會寫出 C/O 時才建議開）",
-    value=st.session_state.get("STRICT_CO", False)
-)
-st.session_state["STRICT_CO"] = strict_include_CO
+exclude_not = st.text_input("排除關鍵字（NOT；例：pediatric OR animal OR case report）", value=st.session_state.get("X",""))
+extra_kw = st.text_input("額外關鍵字/限制（可留白；例：device name / setting）", value=st.session_state.get("EXTRA",""))
 
-exclude_not = st.text_input("排除關鍵字（NOT；例：animal OR pediatric OR case report）", value=st.session_state.get("X",""))
-extra_kw = st.text_input("額外關鍵字（可留空）", value=st.session_state.get("EXTRA",""))
-add_rct = st.checkbox("自動加上 RCT 關鍵字", value=st.session_state.get("ADD_RCT", True))
+st.session_state.update({"P":P,"I":I,"C":C,"O":O,"X":exclude_not,"EXTRA":extra_kw})
 
-st.session_state["P"]=P
-st.session_state["I"]=I
-st.session_state["C"]=C
-st.session_state["O"]=O
-st.session_state["X"]=exclude_not
-st.session_state["EXTRA"]=extra_kw
-st.session_state["ADD_RCT"]=add_rct
+with st.expander("（關鍵）Free-text 擴充（synonyms / phrases / abbreviations；每行或逗號分隔）", expanded=True):
+    st.caption("這裡用來補足『同一個 P/I 但你手動查得到、網站查不到』的主要差異來源。不要寫死範例，請依你的題目貼同義詞。")
+    sP = st.text_area("P 的 synonyms（可留白）", value=st.session_state.get("P_SYNS",""), height=90)
+    sI = st.text_area("I 的 synonyms（可留白）", value=st.session_state.get("I_SYNS",""), height=90)
+    sC = st.text_area("C 的 synonyms（可留白）", value=st.session_state.get("C_SYNS",""), height=90)
+    sO = st.text_area("O 的 synonyms（可留白）", value=st.session_state.get("O_SYNS",""), height=90)
+    sX = st.text_area("Extra 的 synonyms（可留白）", value=st.session_state.get("EXTRA_SYNS",""), height=70)
+    st.session_state.update({"P_SYNS":sP,"I_SYNS":sI,"C_SYNS":sC,"O_SYNS":sO,"EXTRA_SYNS":sX})
 
-with st.expander("MeSH term 同步（建議，可留空不用）", expanded=False):
+with st.expander("MeSH term 同步（可選，查不到很正常）", expanded=False):
     def mesh_picker(label: str, term: str, key_prefix: str) -> str:
         term = (term or "").strip()
         if not term:
@@ -727,7 +820,7 @@ with st.expander("MeSH term 同步（建議，可留空不用）", expanded=Fals
         )
         st.session_state[f"{key_prefix}_MESH"] = choice
         if sug:
-            st.caption("建議：" + " / ".join(sug[:6]))
+            st.caption("建議：" + " / ".join(sug[:8]))
         else:
             st.caption("查不到建議（或 API 暫時不可用）。")
         return choice
@@ -738,67 +831,127 @@ with st.expander("MeSH term 同步（建議，可留空不用）", expanded=Fals
     mesh_picker("O", O, "O")
     mesh_picker("Extra", extra_kw, "EXTRA")
 
-# ---- Build PubMed query (DEFAULT: P + I only) ----
-parts = []
-if P.strip():
-    parts.append(build_pubmed_block(P, st.session_state.get("P_MESH","")))
-if I.strip():
-    parts.append(build_pubmed_block(I, st.session_state.get("I_MESH","")))
+strict_include_CO = st.checkbox("嚴格把 C / O 納入檢索（會降低召回率；預設關閉）", value=st.session_state.get("STRICT_CO", False))
+include_rct_filter = st.checkbox("在檢索式階段就套 RCT filter（可能大幅漏抓；預設關閉，建議後面再篩）", value=st.session_state.get("INCLUDE_RCT_FILTER", False))
+st.session_state["STRICT_CO"] = strict_include_CO
+st.session_state["INCLUDE_RCT_FILTER"] = include_rct_filter
 
-# Only include C/O if strict mode enabled
-if strict_include_CO:
-    if C.strip():
-        parts.append(build_pubmed_block(C, st.session_state.get("C_MESH","")))
-    if O.strip():
-        parts.append(build_pubmed_block(O, st.session_state.get("O_MESH","")))
+pico_now = {"P":P,"I":I,"C":C,"O":O,"X":exclude_not,"EXTRA":extra_kw}
+mesh_now = {"P":st.session_state.get("P_MESH",""),"I":st.session_state.get("I_MESH",""),
+            "C":st.session_state.get("C_MESH",""),"O":st.session_state.get("O_MESH",""),
+            "EXTRA":st.session_state.get("EXTRA_MESH","")}
+syns_now = {"P":st.session_state.get("P_SYNS",""),"I":st.session_state.get("I_SYNS",""),
+            "C":st.session_state.get("C_SYNS",""),"O":st.session_state.get("O_SYNS",""),
+            "EXTRA":st.session_state.get("EXTRA_SYNS","")}
 
-if extra_kw.strip():
-    parts.append(build_pubmed_block(extra_kw, st.session_state.get("EXTRA_MESH","")))
+auto_q = build_pubmed_query(pico_now, mesh_now, syns_now, include_CO=strict_include_CO, include_rct_filter=include_rct_filter)
 
-if add_rct:
-    parts.append('(randomized controlled trial[tiab] OR randomised[tiab] OR randomized[tiab] OR trial[tiab] OR "Randomized Controlled Trial"[Publication Type])')
+auto_follow = st.checkbox("PubMed 搜尋式自動跟隨（會覆蓋手動修改）", value=st.session_state.get("AUTO_FOLLOW_QUERY", True))
+st.session_state["AUTO_FOLLOW_QUERY"] = auto_follow
 
-base_query = " AND ".join([p for p in parts if p]).strip()
-pubmed_query_auto = ""
-if base_query:
-    pubmed_query_auto = f"({base_query})"
-    if exclude_not.strip():
-        pubmed_query_auto += f" NOT ({exclude_not.strip()})"
+if auto_follow and auto_q:
+    st.session_state["PUBMED_QUERY"] = auto_q
 
-auto_follow = st.checkbox(
-    "PubMed 搜尋式自動跟隨 PICO/MeSH（會覆蓋手動修改）",
-    value=st.session_state.get("AUTO_FOLLOW", True)
-)
-st.session_state["AUTO_FOLLOW"] = auto_follow
-
-has_min_inputs = bool(P.strip() or I.strip() or extra_kw.strip())
-
-# Auto-follow: only override when there is meaningful auto query
-if auto_follow:
-    if has_min_inputs and pubmed_query_auto:
-        st.session_state["PUBMED_QUERY"] = pubmed_query_auto
-    elif not has_min_inputs:
-        st.info("提示：請至少填 P 或 I（或 Extra），系統才會自動生成 PubMed 搜尋式。")
-    else:
-        # has_min_inputs but auto query empty -> do not wipe user's query
-        st.warning("自動組 query 失敗（可能輸入為空或被視為無效）；不會覆蓋你原本的搜尋式。")
-
-colQ1, colQ2 = st.columns([1, 3])
+colQ1, colQ2 = st.columns([1,3])
 with colQ1:
     if st.button("套用：重建自動搜尋式"):
-        if has_min_inputs and pubmed_query_auto:
-            st.session_state["PUBMED_QUERY"] = pubmed_query_auto
+        if auto_q:
+            st.session_state["PUBMED_QUERY"] = auto_q
         else:
-            st.warning("無法重建：請先填 P 或 I（或 Extra）。")
-
+            st.warning("無法產生搜尋式：請至少填 P 或 I（或 synonyms）。")
 with colQ2:
-    pubmed_query = st.text_area("PubMed 搜尋式（可直接手動改）", value=st.session_state.get("PUBMED_QUERY",""), height=120)
+    pubmed_query = st.text_area("自動產生的 PubMed Query（已含 MeSH/同義詞，可手動微調）", value=st.session_state.get("PUBMED_QUERY",""), height=120)
     st.session_state["PUBMED_QUERY"] = pubmed_query
 
 # =========================================================
-# Step 1-1: extraction schema
+# Step 1A: BEFORE ALL - Feasibility report + Existing SR/MA scan (restored)
 # =========================================================
-st.subheader("Step 1-1. extraction schema（欄位不寫死，可自訂；也可由 AI 建議）")
+st.subheader("Step 1A.（開始所有步驟前）搜尋既有主題 + 可行性報告 + PICO/criteria/schema 建議")
+
+colF1, colF2, colF3 = st.columns([1,1,1])
+with colF1:
+    if st.button("1A-1 既有 SR/MA 掃描（PubMed）"):
+        if not st.session_state.get("PUBMED_QUERY","").strip():
+            st.error("請先產生/填入 PubMed query。")
+        else:
+            with st.spinner("掃描中…"):
+                fb = srma_scan_pubmed(st.session_state["PUBMED_QUERY"], top_n=25)
+                st.session_state["feasibility"]["srma_summary"] = fb["summary"]
+                st.session_state["feasibility"]["srma_hits"] = fb["hits"]
+with colF2:
+    if st.button("1A-2 產出可行性報告（LLM）"):
+        if not llm_available():
+            st.error("未設定 LLM，無法產出完整可行性報告。")
+        elif not st.session_state.get("PUBMED_QUERY","").strip():
+            st.error("請先產生/填入 PubMed query。")
+        else:
+            with st.spinner("LLM 分析中…"):
+                hits = st.session_state["feasibility"].get("srma_hits", pd.DataFrame())
+                js = feasibility_llm(pico_now, goal_mode, clinical_context, hits, st.session_state["PUBMED_QUERY"])
+                st.session_state["feasibility"]["llm_json"] = js
+with colF3:
+    st.caption("建議流程：先掃描既有 SR/MA → 再出可行性報告（可能需要少量人工判斷，決定是否縮小/轉向題目）。")
+
+fb = st.session_state.get("feasibility", {})
+if fb.get("srma_summary"):
+    st.info(fb["srma_summary"])
+    hits = fb.get("srma_hits", pd.DataFrame())
+    if isinstance(hits, pd.DataFrame) and not hits.empty:
+        st.dataframe(hits, use_container_width=True)
+        st.download_button("下載 SR/MA 命中清單（CSV）", data=to_csv_bytes(hits), file_name="srma_hits.csv", mime="text/csv")
+
+js = fb.get("llm_json")
+if js:
+    if js.get("error"):
+        st.error(js.get("error"))
+        st.code(js.get("raw",""), language="text")
+    else:
+        st.markdown("**LLM 可行性報告（JSON）**")
+        st.code(json.dumps(js, ensure_ascii=False, indent=2), language="json")
+
+        st.markdown("**在此層級就定義 inclusion/exclusion（可套用）**")
+        if st.button("套用：把 LLM criteria 寫入 criteria_text"):
+            inc = js.get("inclusion_criteria") or []
+            exc = js.get("exclusion_criteria") or []
+            lines = ["Inclusion criteria:"]
+            if isinstance(inc, list):
+                for r in inc:
+                    if isinstance(r, dict):
+                        lines.append(f"- [{r.get('id','')}] {r.get('rule','')}")
+                    else:
+                        lines.append(f"- {r}")
+            else:
+                lines.append(str(inc))
+            lines.append("")
+            lines.append("Exclusion criteria:")
+            if isinstance(exc, list):
+                for r in exc:
+                    if isinstance(r, dict):
+                        lines.append(f"- [{r.get('id','')}] {r.get('rule','')}")
+                    else:
+                        lines.append(f"- {r}")
+            else:
+                lines.append(str(exc))
+            st.session_state["criteria_text"] = "\n".join(lines).strip()
+            st.success("已套用 criteria。")
+
+        st.markdown("**在此層級就規劃 extraction sheet（可套用）**")
+        if st.button("套用：把 LLM schema 寫入 extraction schema"):
+            es = js.get("recommended_extraction_schema") or {}
+            base_cols2 = es.get("base_cols") or []
+            outcomes2 = es.get("outcomes") or []
+            if base_cols2:
+                st.session_state["BASECOLS"] = "\n".join(base_cols2)
+            if outcomes2:
+                st.session_state["OUTCOME_LINES"] = "\n".join(outcomes2)
+            st.success("已套用 schema（請往下檢查/微調）。")
+
+st.markdown("---")
+
+# =========================================================
+# Step 1B: extraction schema (NOT hard-coded)
+# =========================================================
+st.subheader("Step 1B. extraction schema（欄位不寫死；可自訂；可由 AI 建議）")
 
 default_outcomes = st.session_state.get("OUTCOME_LINES", "Primary outcome\nSecondary outcome 1\nSecondary outcome 2")
 outcome_lines = st.text_area("Outcome / 欄位名稱（每行一個，可自訂）", value=default_outcomes, height=120)
@@ -811,8 +964,7 @@ default_base_cols = st.session_state.get(
         "Intervention","Sample size (Intervention)",
         "Comparator","Sample size (Comparator)",
         "Follow-up","Key outcomes",
-        "PICO (with NOT/exclude)","AI TA decision + reason",
-        "Fulltext availability / note",
+        "Notes (table/figure/page)","Fulltext availability / note",
     ])
 )
 base_cols_text = st.text_area("基本欄位（每行一個）", value=default_base_cols, height=160)
@@ -823,323 +975,84 @@ schema = {
     "outcomes": [x.strip() for x in (outcome_lines or "").splitlines() if x.strip()],
 }
 
-# =========================================================
-# Step 1-2: Feasibility scan + optional LLM feasibility report
-# =========================================================
-st.header("Step 1-2. 可行性掃描（先找 SR/MA + criteria/schema 建議）")
-
-colF1, colF2 = st.columns([1,1])
-with colF1:
-    if st.button("執行 SR/MA 掃描（PubMed）"):
-        with st.spinner("掃描中…"):
-            fb = quick_srma_scan(st.session_state.get("PUBMED_QUERY",""), top_n=20)
-            st.session_state["feasibility"] = {"summary": fb["summary"], "hits": fb["hits"], "llm_json": None}
-
-with colF2:
-    st.caption("目的：確認是否已有 SR/MA，並為 criteria / schema 提供依據。")
-
-fb = st.session_state.get("feasibility", {"summary":"", "hits": pd.DataFrame(), "llm_json": None})
-if fb.get("summary"):
-    st.info(fb["summary"])
-    if isinstance(fb.get("hits"), pd.DataFrame) and not fb["hits"].empty:
-        st.dataframe(fb["hits"], use_container_width=True)
-        st.download_button("下載 SR/MA 清單（CSV）", data=to_csv_bytes(fb["hits"]),
-                           file_name="feasibility_srma_hits.csv", mime="text/csv")
-
-st.markdown("#### Inclusion / Exclusion criteria（可先手寫；也可由 LLM 生成）")
-criteria_text = st.text_area("criteria（可留空）", value=st.session_state.get("criteria_text",""), height=220)
+st.markdown("#### criteria（可先手寫；或用 Step 1A LLM 套用）")
+criteria_text = st.text_area("Inclusion/Exclusion criteria", value=st.session_state.get("criteria_text",""), height=220)
 st.session_state["criteria_text"] = criteria_text
-
-if llm_available():
-    if st.button("用 LLM 產出：criteria + schema 建議"):
-        with st.spinner("LLM 分析中…"):
-            pico0 = {"P":P, "I":I, "C":C, "O":O, "X":exclude_not}
-            js = feasibility_report_llm(pico0, goal_mode, clinical_context, fb.get("hits", pd.DataFrame()), st.session_state.get("PUBMED_QUERY",""))
-            st.session_state["feasibility"]["llm_json"] = js
-
-    js = st.session_state["feasibility"].get("llm_json")
-    if js:
-        if js.get("error"):
-            st.error(js.get("error"))
-            st.code(js.get("raw",""), language="text")
-        else:
-            st.subheader("LLM 建議（可套用到 criteria / schema）")
-            st.code(json.dumps(js, ensure_ascii=False, indent=2), language="json")
-
-            a1,a2 = st.columns(2)
-            with a1:
-                if st.button("套用：criteria"):
-                    inc = js.get("inclusion_rules") or []
-                    exc = js.get("exclusion_rules") or []
-                    lines = ["Inclusion criteria (rule IDs):"]
-                    for r in inc:
-                        lines.append(f"- [{r.get('id','')}] {r.get('rule','')}")
-                    lines.append("")
-                    lines.append("Exclusion criteria (rule IDs):")
-                    for r in exc:
-                        lines.append(f"- [{r.get('id','')}] {r.get('rule','')}")
-                    st.session_state["criteria_text"] = "\n".join(lines).strip()
-                    st.rerun()
-            with a2:
-                if st.button("套用：extraction schema"):
-                    es = js.get("extraction_schema") or {}
-                    base_cols2 = es.get("base_cols") or schema["base_cols"]
-                    outcomes2 = es.get("outcomes") or schema["outcomes"]
-                    st.session_state["BASECOLS"] = "\n".join(base_cols2)
-                    st.session_state["OUTCOME_LINES"] = "\n".join(outcomes2)
-                    st.rerun()
-else:
-    st.caption("未設定 LLM：這裡提供 SR/MA 掃描 + 你手動輸入 criteria/schema。")
 
 st.markdown("---")
 
 # =========================================================
-# [AUTO] Step 0: One-click pipeline + Word export
+# Step 2: Fetch records + run AI TA screening
 # =========================================================
-st.header("Step 0. 一鍵自動跑（抓文獻→AI 粗篩→PRISMA→匯出）")
+st.header("Step 2. 抓文獻並執行 AI 初篩（從勾選的資料庫）")
 
-auto_use_ctgov = st.checkbox("一鍵跑時同時抓 ClinicalTrials.gov", value=False)
-auto_pubmed_max = st.number_input("一鍵跑：PubMed 抓取上限（0=全部；太大會慢）", min_value=0, max_value=2000000, value=0, step=200)
-auto_ctgov_max = st.number_input("一鍵跑：CT.gov 抓取上限", min_value=0, max_value=20000, value=200, step=50)
-auto_batch = st.number_input("一鍵跑：AI TA batch size", min_value=20, max_value=500, value=200, step=20)
-auto_engine = st.selectbox("一鍵跑：篩選引擎", options=["Auto (LLM if available else rule)", "Rule-based", "LLM"], index=0)
+use_pubmed = st.checkbox("PubMed", value=True)
+use_crossref = st.checkbox("CrossRef（期刊文獻/DOI；可補漏）", value=False)
 
-def ta_prompt(criteria_text_: str, pico_: dict, rec: dict) -> List[dict]:
-    sys = "You are an SR/MA screening assistant. Be conservative. Output ONLY valid JSON."
-    user = {
-        "task": "Title/Abstract screening",
-        "criteria_text": criteria_text_,
-        "pico": pico_,
-        "record": {"title": rec.get("title",""), "abstract": rec.get("abstract",""),
-                   "year": rec.get("year",""), "source": rec.get("source","")},
-        "output_schema": {"label": "Include/Exclude/Unsure", "confidence": "0..1",
-                          "reason": "short rationale", "matched_rules": "list of rule IDs if any"},
-        "policy": [
-            "If insufficient info, choose Unsure.",
-            "Prefer recall over precision in early screening."
-        ]
-    }
-    return [{"role":"system","content":sys},{"role":"user","content":json.dumps(user, ensure_ascii=False)}]
+max_records = st.number_input("每個資料庫抓取上限（0=全部；太大會慢）", min_value=0, max_value=2000000, value=1000, step=200)
+polite_delay = st.slider("（可選）API 友善延遲（秒）", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
 
-def run_ta_llm(df_chunk: pd.DataFrame, pico_: dict, criteria_text_: str) -> pd.DataFrame:
-    out = []
-    for _, r in df_chunk.iterrows():
-        rid = r["record_id"]
-        rec = r.to_dict()
-        txt = llm_chat(ta_prompt(criteria_text_, pico_, rec), temperature=0.1, timeout=90)
-        js = json_from_text(txt or "")
-        if not js:
-            rb = ai_screen_rule_based(r, pico_)
-            js = {"label": rb["label"], "confidence": rb["confidence"], "reason": rb["reason"], "matched_rules": []}
-        out.append({
-            "record_id": rid,
-            "AI_label": js.get("label","Unsure"),
-            "AI_confidence": js.get("confidence", 0.0),
-            "AI_reason": js.get("reason",""),
-            "AI_matched_rules": ",".join(js.get("matched_rules", []) or []),
-        })
-    return pd.DataFrame(out)
+ta_engine = st.selectbox("Title/Abstract 初篩引擎", options=["Auto (LLM if available else rule)", "Rule-based", "LLM"], index=0)
 
 def run_ta_rule(df_chunk: pd.DataFrame, pico_: dict) -> pd.DataFrame:
     out = []
     for _, r in df_chunk.iterrows():
-        rid = r["record_id"]
         rb = ai_screen_rule_based(r, pico_)
-        out.append({
-            "record_id": rid,
-            "AI_label": rb["label"],
-            "AI_confidence": rb["confidence"],
-            "AI_reason": rb["reason"],
-            "AI_matched_rules": rb.get("rule_trace",""),
-        })
+        out.append({"record_id": r["record_id"], "AI_label": rb["label"], "AI_confidence": rb["confidence"], "AI_reason": rb["reason"]})
     return pd.DataFrame(out)
 
-def build_summary_df(df_records_: pd.DataFrame) -> pd.DataFrame:
-    ai = st.session_state.get("ai_ta_df", pd.DataFrame())
-    if ai is None or ai.empty:
-        ai = pd.DataFrame(columns=["record_id","AI_label","AI_confidence","AI_reason","AI_matched_rules"])
-    rows = []
-    for _, r in df_records_.iterrows():
-        rid = r["record_id"]
-        a = ai[ai["record_id"]==rid].head(1)
-        a = a.iloc[0].to_dict() if not a.empty else {}
-        openurl = build_openurl(st.session_state.get("RESOLVER_BASE",""),
-                                doi=r.get("doi",""), pmid=r.get("pmid",""), title=r.get("title",""))
-        openurl = apply_ezproxy(st.session_state.get("EZPROXY",""), openurl) if openurl else ""
-        rows.append({
-            "record_id": rid,
-            "pmid": r.get("pmid",""),
-            "doi": r.get("doi",""),
-            "year": r.get("year",""),
-            "first_author": r.get("first_author",""),
-            "title": r.get("title",""),
-            "source": r.get("source",""),
-            "institution_openurl": openurl,
-            "AI_label": a.get("AI_label",""),
-            "AI_confidence": a.get("AI_confidence",""),
-            "AI_reason": a.get("AI_reason",""),
-            "AI_matched_rules": a.get("AI_matched_rules",""),
-            "TA_final_AI": st.session_state["ta_final"].get(rid, "Unsure"),
-            "FT_decision": st.session_state["ft_decisions"].get(rid, "Not reviewed yet"),
-            "FT_reason": st.session_state["ft_reasons"].get(rid, ""),
-            "FT_note_cannot_obtain": st.session_state["ft_note"].get(rid, ""),
-            "FT_fulltext_text": st.session_state["ft_text"].get(rid, ""),
-        })
-    return pd.DataFrame(rows)
+def run_ta_llm(df_chunk: pd.DataFrame, pico_: dict, criteria_text_: str) -> pd.DataFrame:
+    out = []
+    sys = "You are an SR/MA screening assistant. Output ONLY valid JSON."
+    for _, r in df_chunk.iterrows():
+        user = {
+            "task":"Title/Abstract screening",
+            "pico": pico_,
+            "criteria_text": criteria_text_,
+            "record": {"title": r.get("title",""), "abstract": r.get("abstract",""), "year": r.get("year",""), "source": r.get("source","")},
+            "output_schema": {"label":"Include/Exclude/Unsure", "confidence":"0..1", "reason":"short"}
+        }
+        txt = llm_chat([{"role":"system","content":sys},{"role":"user","content":json.dumps(user, ensure_ascii=False)}], temperature=0.1, timeout=90)
+        js = json_from_text(txt or "")
+        if not js:
+            rb = ai_screen_rule_based(r, pico_)
+            js = {"label": rb["label"], "confidence": rb["confidence"], "reason": rb["reason"]}
+        out.append({"record_id": r["record_id"], "AI_label": js.get("label","Unsure"), "AI_confidence": js.get("confidence",0.0), "AI_reason": js.get("reason","")})
+    return pd.DataFrame(out)
 
-def compute_prisma_counts(df_all_raw: pd.DataFrame, df_dedup: pd.DataFrame) -> dict:
-    identified = len(df_all_raw)
-    deduped = len(df_dedup)
-    dup_removed = max(0, identified - deduped)
-
-    ta_vals = [st.session_state["ta_final"].get(rid, "Unsure") for rid in df_dedup["record_id"].tolist()]
-    k_include = sum(1 for x in ta_vals if x == "Include")
-    k_exclude = sum(1 for x in ta_vals if x == "Exclude")
-    k_unsure  = sum(1 for x in ta_vals if x == "Unsure")
-
-    ft_assessed = k_include + k_unsure
-    ft = st.session_state.get("ft_decisions", {})
-    inc_ft = sum(1 for _,v in ft.items() if v == "Include for meta-analysis")
-    exc_ft = sum(1 for _,v in ft.items() if v == "Exclude after full-text")
-
-    return {
-        "identified": identified,
-        "duplicates_removed": dup_removed,
-        "records_screened": deduped,
-        "records_excluded_ta": k_exclude,
-        "fulltext_assessed": ft_assessed,
-        "fulltext_excluded": exc_ft,
-        "studies_included_meta": inc_ft,
-        "ta_include": k_include,
-        "ta_unsure": k_unsure,
-    }
-
-def auto_build_search_rows(pubmed_query_: str, pubmed_count: int, ctgov_used: bool, ctgov_count: int) -> List[List[str]]:
-    rows = []
-    rows.append(["PubMed", "1", pubmed_query_, str(pubmed_count)])
-    if ctgov_used:
-        rows.append(["ClinicalTrials.gov", "1", pubmed_query_, str(ctgov_count)])
-    rows.append(["Embase", "", "(optional) translate from PubMed query", ""])
-    rows.append(["OVID-Medline", "", "(optional) translate from PubMed query", ""])
-    rows.append(["CENTRAL", "", "(optional) translate from PubMed query", ""])
-    return rows
-
-# ----- docx helpers (only used when HAS_DOCX=True) -----
-def docx_add_heading(doc, text: str, level: int = 1):
-    p = doc.add_paragraph()
-    run = p.add_run(text)
-    run.bold = True
-    run.font.size = Pt(12 if level==1 else 11)
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-def docx_add_table(doc, headers: List[str], rows: List[List[str]]):
-    table = doc.add_table(rows=1, cols=len(headers))
-    hdr_cells = table.rows[0].cells
-    for i,h in enumerate(headers):
-        hdr_cells[i].text = h
-    for r in rows:
-        cells = table.add_row().cells
-        for i,val in enumerate(r):
-            cells[i].text = str(val)
-    return table
-
-def make_word_supplement(pubmed_query_: str, prisma: dict, summary_df_: pd.DataFrame,
-                         search_rows: List[List[str]]) -> bytes:
-    if not HAS_DOCX:
-        return b""
-
-    doc = Document()
-    title = doc.add_paragraph()
-    tr = title.add_run("Supplement (auto-generated)")
-    tr.bold = True
-    tr.font.size = Pt(14)
-    doc.add_paragraph(f"Generated time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    docx_add_heading(doc, "Supplement Table 1. Search Strategy", level=1)
-    doc.add_paragraph("PubMed query:")
-    doc.add_paragraph(pubmed_query_)
-
-    headers = ["Database", "#", "Search syntax", "Citations found"]
-    docx_add_table(doc, headers, search_rows)
-
-    doc.add_paragraph()
-    docx_add_heading(doc, "Supplement Figure 1. PRISMA Flow (numbers)", level=1)
-    lines = [
-        f"Records identified: {prisma.get('identified',0)}",
-        f"Duplicates removed: {prisma.get('duplicates_removed',0)}",
-        f"Records screened (deduplicated): {prisma.get('records_screened',0)}",
-        f"Records excluded by title/abstract (AI): {prisma.get('records_excluded_ta',0)}",
-        f"Full-text articles queued/assessed: {prisma.get('fulltext_assessed',0)}",
-        f"Full-text excluded: {prisma.get('fulltext_excluded',0)}",
-        f"Studies included in meta-analysis: {prisma.get('studies_included_meta',0)}",
-    ]
-    for s in lines:
-        doc.add_paragraph(s)
-
-    doc.add_paragraph()
-    docx_add_heading(doc, "Screening snapshot (top 50)", level=1)
-    snap = summary_df_.copy()
-    keep = ["record_id","year","first_author","title","source","TA_final_AI","AI_reason","institution_openurl"]
-    for c in keep:
-        if c not in snap.columns:
-            snap[c] = ""
-    snap = snap[keep].head(50)
-    rows = [[str(x) for x in r] for r in snap.values.tolist()]
-    docx_add_table(doc, keep, rows)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-def run_one_click_pipeline(auto_use_ctgov: bool, auto_pubmed_max: int, auto_ctgov_max: int,
-                           auto_batch: int, auto_engine: str):
+def fetch_all_selected() -> Tuple[pd.DataFrame, Dict[str,int]]:
     q = (st.session_state.get("PUBMED_QUERY","") or "").strip()
     if not q:
-        st.error("PubMed 搜尋式為空：請至少填 P 或 I（或手動貼搜尋式）。")
-        return
-
-    pico0 = {
-        "P": st.session_state.get("P",""),
-        "I": st.session_state.get("I",""),
-        "C": st.session_state.get("C",""),
-        "O": st.session_state.get("O",""),
-        "X": st.session_state.get("X",""),
-    }
-    criteria_now = st.session_state.get("criteria_text","")
-
-    with st.spinner("Step 2：抓 PubMed 中…"):
-        st.session_state.pubmed_progress = st.progress(0.0)
-        st.session_state.pubmed_fetch_progress = st.progress(0.0)
-        dfp, cnt = fetch_pubmed(q, max_records=int(auto_pubmed_max), batch_size=200, polite_delay=0.0)
-        st.session_state.pubmed_progress.empty()
-        st.session_state.pubmed_fetch_progress.empty()
-        st.session_state["pubmed_total_count"] = cnt
+        st.error("PubMed query 為空，請先在 Step 1 產生/填入。")
+        return pd.DataFrame(), {}
 
     dfs = []
-    df_all_raw = pd.DataFrame()
-    if not dfp.empty:
-        dfs.append(dfp)
-    ct_cnt = 0
-    if auto_use_ctgov:
-        with st.spinner("Step 2：抓 ClinicalTrials.gov 中…"):
-            dft = fetch_ctgov(q, max_records=int(auto_ctgov_max))
-            if not dft.empty:
-                ct_cnt = len(dft)
-                dfs.append(dft)
+    counts = {}
+
+    if use_pubmed:
+        dfp, cnt = fetch_pubmed(q, max_records=int(max_records), batch_size=200, polite_delay=float(polite_delay))
+        counts["PubMed"] = len(dfp)
+        st.session_state["pubmed_total_count"] = cnt
+        if not dfp.empty:
+            dfs.append(dfp)
+
+    if use_crossref:
+        dfc = crossref_search(q, rows=int(min(max_records, 200)))
+        counts["Crossref"] = len(dfc)
+        if not dfc.empty:
+            dfs.append(dfc)
 
     if not dfs:
-        st.error("沒有抓到任何資料。")
-        return
+        return pd.DataFrame(), counts
 
-    df_all_raw = pd.concat(dfs, ignore_index=True)
-    df_all_raw = ensure_columns(df_all_raw, ["record_id","pmid","pmcid","doi","title","abstract","year",
-                                             "first_author","journal","source","url","doi_url","pmc_url"], default="")
-    df_dedup = deduplicate(df_all_raw)
-    st.session_state["records_df"] = df_dedup
-    st.session_state["screen_cursor"] = 0
+    df_all = pd.concat(dfs, ignore_index=True)
+    df_all = ensure_columns(df_all, ["record_id","pmid","pmcid","doi","title","abstract","year",
+                                     "first_author","journal","source","url","doi_url","pmc_url"], default="")
+    df_dedup = deduplicate(df_all)
+    return df_dedup, counts
 
-    # Init per-record states
-    for rid in df_dedup["record_id"].tolist():
+def init_record_states(df: pd.DataFrame):
+    for rid in df["record_id"].tolist():
         st.session_state["ta_final"].setdefault(rid, "Unsure")
         st.session_state["ft_decisions"].setdefault(rid, "Not reviewed yet")
         st.session_state["ft_reasons"].setdefault(rid, "")
@@ -1147,229 +1060,51 @@ def run_one_click_pipeline(auto_use_ctgov: bool, auto_pubmed_max: int, auto_ctgo
         st.session_state["ft_note"].setdefault(rid, "")
         st.session_state["rob2"].setdefault(rid, {})
 
-    # Choose engine
-    if auto_engine == "LLM":
-        use_llm = True
-    elif auto_engine == "Rule-based":
+if st.button("Step 2. 抓文獻並執行 AI 初篩"):
+    with st.spinner("抓取中…"):
+        df_dedup, counts = fetch_all_selected()
+    if df_dedup.empty:
+        st.error("沒有抓到資料。")
+    else:
+        st.session_state["records_df"] = df_dedup
+        init_record_states(df_dedup)
+        st.success(f"合併去重後共有 {len(df_dedup)} 篇。各庫：{counts}")
+
+        # Run TA screening immediately (as your original UX)
+        pico_basic = {"P":P,"I":I,"C":C,"O":O,"X":exclude_not}
+        engine_use = ta_engine
         use_llm = False
-    else:
-        use_llm = llm_available()
+        if engine_use.startswith("Auto"):
+            use_llm = llm_available()
+        elif engine_use == "LLM":
+            use_llm = True
+        else:
+            use_llm = False
 
-    prog = st.progress(0.0)
-    ai_rows = []
-    with st.spinner("Step 3：AI Title/Abstract 全量粗篩中…"):
-        n = len(df_dedup)
-        for i in range(0, n, int(auto_batch)):
-            chunk = df_dedup.iloc[i:i+int(auto_batch)].copy()
+        with st.spinner("AI Title/Abstract 初篩中…"):
             if use_llm and llm_available():
-                df_ai = run_ta_llm(chunk, pico0, criteria_now)
+                df_ai = run_ta_llm(df_dedup, pico_basic, st.session_state.get("criteria_text",""))
             else:
-                df_ai = run_ta_rule(chunk, pico0)
-            ai_rows.append(df_ai)
-            for _, rr in df_ai.iterrows():
-                st.session_state["ta_final"][rr["record_id"]] = rr["AI_label"]
-            prog.progress(min(1.0, (i+len(chunk))/max(n,1)))
-    prog.empty()
+                df_ai = run_ta_rule(df_dedup, pico_basic)
 
-    st.session_state["ai_ta_df"] = pd.concat(ai_rows, ignore_index=True).drop_duplicates(subset=["record_id"], keep="last")
-    summary_df0 = build_summary_df(df_dedup)
-    prisma = compute_prisma_counts(df_all_raw, df_dedup)
-    st.session_state["AUTO_PRISMA"] = prisma
-
-    search_rows = auto_build_search_rows(q, st.session_state.get("pubmed_total_count",0), auto_use_ctgov, ct_cnt)
-
-    if HAS_DOCX:
-        st.session_state["AUTO_WORD_BYTES"] = make_word_supplement(q, prisma, summary_df0, search_rows)
-    else:
-        st.session_state["AUTO_WORD_BYTES"] = b""
-
-    # Initialize extraction wide sheet skeleton
-    base_frame = summary_df0[["record_id","pmid","doi","title","institution_openurl","FT_note_cannot_obtain"]].copy()
-    for c in schema["base_cols"]:
-        if c not in base_frame.columns:
-            base_frame[c] = ""
-    for ocol in schema["outcomes"]:
-        if ocol not in base_frame.columns:
-            base_frame[ocol] = ""
-    for c in ["Effect_measure","Effect","Lower_CI","Upper_CI","Timepoint","Unit"]:
-        if c not in base_frame.columns:
-            base_frame[c] = ""
-    st.session_state["extract_wide_df"] = base_frame
-
-if st.button("一鍵跑：抓文獻→AI 粗篩→PRISMA→匯出 Word"):
-    run_one_click_pipeline(
-        auto_use_ctgov=auto_use_ctgov,
-        auto_pubmed_max=int(auto_pubmed_max),
-        auto_ctgov_max=int(auto_ctgov_max),
-        auto_batch=int(auto_batch),
-        auto_engine=auto_engine
-    )
-
-if st.session_state.get("AUTO_WORD_BYTES"):
-    st.success("已完成一鍵流程，可下載 Word。")
-    st.download_button(
-        "下載 Word supplement（docx）",
-        data=st.session_state["AUTO_WORD_BYTES"],
-        file_name="supplement_auto.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
-elif st.session_state.get("AUTO_PRISMA") and not HAS_DOCX:
-    st.warning("已完成一鍵流程（含 PRISMA），但環境未安裝 python-docx，因此無法輸出 Word。")
-
-st.markdown("---")
-
-# =========================================================
-# [12] Step 2: Fetch records (manual mode)
-# =========================================================
-st.header("Step 2. 抓文獻（手動模式；若你用一鍵跑可略過）")
-
-use_pubmed = st.checkbox("PubMed", value=True)
-use_ctgov = st.checkbox("ClinicalTrials.gov（可選）", value=False)
-
-colLim1, colLim2 = st.columns([1,1])
-with colLim1:
-    pubmed_max = st.number_input("PubMed 抓取上限（0=全部；很大會很慢）", min_value=0, max_value=2000000, value=0, step=200)
-with colLim2:
-    ctgov_max = st.number_input("CT.gov 抓取上限", min_value=0, max_value=20000, value=200, step=50)
-
-polite_delay = st.slider("（可選）API 友善延遲（秒）", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
-
-if st.button("開始抓文獻（Step 2）"):
-    q = (st.session_state.get("PUBMED_QUERY","") or "").strip()
-    if not q:
-        st.error("PubMed 搜尋式為空：請至少填 P 或 I（或手動貼搜尋式）。")
-    else:
-        with st.spinner("抓取中…"):
-            dfs = []
-            total_count = 0
-            try:
-                if use_pubmed:
-                    st.session_state.pubmed_progress = st.progress(0.0)
-                    st.session_state.pubmed_fetch_progress = st.progress(0.0)
-                    dfp, cnt = fetch_pubmed(q, max_records=int(pubmed_max), batch_size=200, polite_delay=float(polite_delay))
-                    st.session_state.pubmed_progress.empty()
-                    st.session_state.pubmed_fetch_progress.empty()
-                    total_count = cnt
-                    if not dfp.empty:
-                        dfs.append(dfp)
-                        st.success(f"PubMed 回傳：{len(dfp)}（總量估計 count≈{cnt}）")
-                    else:
-                        st.warning(f"PubMed：0（count≈{cnt}）")
-
-                if use_ctgov and ctgov_max > 0:
-                    dft = fetch_ctgov(q, max_records=int(ctgov_max))
-                    if not dft.empty:
-                        dfs.append(dft)
-                        st.success(f"ClinicalTrials.gov：{len(dft)}")
-                    else:
-                        st.warning("ClinicalTrials.gov：0")
-
-                if not dfs:
-                    st.session_state["records_df"] = pd.DataFrame()
-                    st.session_state["pubmed_total_count"] = total_count
-                    st.error("沒有抓到任何資料。")
-                else:
-                    df_all = pd.concat(dfs, ignore_index=True)
-                    df_all = ensure_columns(df_all, ["record_id","pmid","pmcid","doi","title","abstract","year",
-                                                     "first_author","journal","source","url","doi_url","pmc_url"], default="")
-                    identified = len(df_all)
-                    df_dedup = deduplicate(df_all)
-                    st.session_state["records_df"] = df_dedup
-                    st.session_state["pubmed_total_count"] = total_count
-                    st.session_state["screen_cursor"] = 0
-
-                    for rid in df_dedup["record_id"].tolist():
-                        st.session_state["ta_final"].setdefault(rid, "Unsure")
-                        st.session_state["ft_decisions"].setdefault(rid, "Not reviewed yet")
-                        st.session_state["ft_reasons"].setdefault(rid, "")
-                        st.session_state["ft_text"].setdefault(rid, "")
-                        st.session_state["ft_note"].setdefault(rid, "")
-                        st.session_state["rob2"].setdefault(rid, {})
-
-                    st.success(f"合併後 Identified={identified}；去重後={len(df_dedup)}")
-
-            except Exception as e:
-                st.session_state["records_df"] = pd.DataFrame()
-                st.error(f"抓取失敗：{e}")
+        st.session_state["ai_ta_df"] = df_ai
+        for _, rr in df_ai.iterrows():
+            st.session_state["ta_final"][rr["record_id"]] = rr["AI_label"]
+        st.success("已完成 AI 初篩。")
 
 df_records = st.session_state.get("records_df", pd.DataFrame())
-if df_records.empty:
-    st.info("尚未抓取文獻。完成 Step 2 後才會顯示 Step 3-6。")
-    st.stop()
-
-st.caption(f"PubMed 原始 count 估計：{st.session_state.get('pubmed_total_count',0)}")
-
-# =========================================================
-# [13] Step 3: AI Title/Abstract screening
-# =========================================================
-st.header("Step 3. Title/Abstract AI Screening（可全自動；不需逐篇人工勾選）")
-
-pico = {
-    "P": st.session_state.get("P",""),
-    "I": st.session_state.get("I",""),
-    "C": st.session_state.get("C",""),
-    "O": st.session_state.get("O",""),
-    "X": st.session_state.get("X",""),
-}
-
-engine = st.selectbox(
-    "篩選引擎",
-    options=["Rule-based (fast, high recall)", "LLM (more accurate)"] if llm_available() else ["Rule-based (fast, high recall)"],
-    index=0
-)
-
-batch_size = st.number_input("每次處理筆數（大量時建議 50~200）", min_value=10, max_value=500, value=100, step=10)
-run_only_unscreened = st.checkbox("只跑尚未被 AI 判斷的資料", value=True)
-
-already = set()
-if isinstance(st.session_state.get("ai_ta_df"), pd.DataFrame) and not st.session_state["ai_ta_df"].empty:
-    already = set(st.session_state["ai_ta_df"]["record_id"].tolist())
-
-to_process = df_records.copy()
-if run_only_unscreened:
-    to_process = to_process[~to_process["record_id"].isin(already)]
-
-cursor = st.session_state.get("screen_cursor", 0)
-chunk = to_process.iloc[cursor:cursor+int(batch_size)].copy()
-
-colS1, colS2 = st.columns([1,1])
-with colS1:
-    if st.button("AI 初篩：跑下一批"):
-        if chunk.empty:
-            st.info("沒有可處理資料（可能已全部處理完）。")
-        else:
-            with st.spinner(f"處理 {len(chunk)} 篇…"):
-                if engine.startswith("LLM") and llm_available():
-                    df_ai = run_ta_llm(chunk, pico, st.session_state.get("criteria_text",""))
-                else:
-                    df_ai = run_ta_rule(chunk, pico)
-
-                old = st.session_state.get("ai_ta_df", pd.DataFrame())
-                if old is None or old.empty:
-                    st.session_state["ai_ta_df"] = df_ai
-                else:
-                    st.session_state["ai_ta_df"] = pd.concat([old, df_ai], ignore_index=True).drop_duplicates(subset=["record_id"], keep="last")
-
-                for _, rr in df_ai.iterrows():
-                    st.session_state["ta_final"][rr["record_id"]] = rr["AI_label"]
-
-                st.session_state["screen_cursor"] = cursor + len(chunk)
-                st.success("完成。")
-
-with colS2:
-    if st.button("AI 初篩：從頭重跑（清空 AI 結果）"):
-        st.session_state["ai_ta_df"] = pd.DataFrame()
-        st.session_state["ta_final"] = {rid: "Unsure" for rid in df_records["record_id"].tolist()}
-        st.session_state["screen_cursor"] = 0
-        st.success("已清空。")
-
 ai_ta_df = st.session_state.get("ai_ta_df", pd.DataFrame())
-if ai_ta_df is None or ai_ta_df.empty:
-    st.warning("尚未執行 AI 初篩。請按『跑下一批』或用 Step 0 一鍵跑。")
+
+if df_records.empty:
     st.stop()
+
+# =========================================================
+# Step 3: TA screening results + FT links
+# =========================================================
+st.header("Step 3. Title/Abstract screening（含理由；不需像 Covidence 人工逐篇勾）")
 
 view_df = df_records.merge(ai_ta_df, on="record_id", how="left")
-view_df = ensure_columns(view_df, ["AI_label","AI_reason","AI_confidence","AI_matched_rules"], default="")
+view_df = ensure_columns(view_df, ["AI_label","AI_reason","AI_confidence"], default="")
 
 ta_vals = [st.session_state["ta_final"].get(rid, "Unsure") for rid in df_records["record_id"].tolist()]
 k_include = sum(1 for x in ta_vals if x == "Include")
@@ -1377,7 +1112,7 @@ k_exclude = sum(1 for x in ta_vals if x == "Exclude")
 k_unsure  = sum(1 for x in ta_vals if x == "Unsure")
 
 c1,c2,c3,c4 = st.columns(4)
-with c1: st.markdown(f'<div class="kpi"><div class="label">AI screened</div><div class="value">{len(ai_ta_df)}</div></div>', unsafe_allow_html=True)
+with c1: st.markdown(f'<div class="kpi"><div class="label">Total</div><div class="value">{len(df_records)}</div></div>', unsafe_allow_html=True)
 with c2: st.markdown(f'<div class="kpi"><div class="label">Include</div><div class="value">{k_include}</div></div>', unsafe_allow_html=True)
 with c3: st.markdown(f'<div class="kpi"><div class="label">Exclude</div><div class="value">{k_exclude}</div></div>', unsafe_allow_html=True)
 with c4: st.markdown(f'<div class="kpi"><div class="label">Unsure</div><div class="value">{k_unsure}</div></div>', unsafe_allow_html=True)
@@ -1390,9 +1125,6 @@ def want(dec: str) -> bool:
     if filter_mode == "只看 Include": return dec == "Include"
     if filter_mode == "只看 Exclude": return dec == "Exclude"
     return True
-
-st.markdown('<hr class="soft">', unsafe_allow_html=True)
-st.subheader("AI 篩選結果（可稽核）：點開看每篇理由 + 全文欄位")
 
 for _, row in view_df.iterrows():
     rid = row["record_id"]
@@ -1418,7 +1150,6 @@ for _, row in view_df.iterrows():
 
     with st.expander(title, expanded=False):
         st.markdown('<div class="card">', unsafe_allow_html=True)
-
         meta = f"<div class='meta'><b>ID</b>: {rid}"
         if pmid: meta += f" &nbsp;&nbsp; <b>PMID</b>: {pmid}"
         if doi:  meta += f" &nbsp;&nbsp; <b>DOI</b>: {doi}"
@@ -1436,17 +1167,14 @@ for _, row in view_df.iterrows():
         if links:
             st.markdown(" | ".join(links))
 
-        st.markdown(badge_html(ta_dec) + f"<span class='small'>AI Title/Abstract 決策</span>", unsafe_allow_html=True)
+        st.markdown(badge_html(ta_dec) + "<span class='small'> AI Title/Abstract 建議</span>", unsafe_allow_html=True)
         st.write(f"理由：{row.get('AI_reason','')}")
-        if row.get("AI_matched_rules",""):
-            st.caption(f"Matched rules: {row.get('AI_matched_rules','')}")
         st.caption(f"信心度：{row.get('AI_confidence','')}")
 
         st.markdown("### Abstract")
         st.write(row.get("abstract","") or "_No abstract available._")
 
         st.markdown('<hr class="soft">', unsafe_allow_html=True)
-
         st.markdown("### Full-text decision（看完全文後回填）")
         ft_opts = ["Not reviewed yet", "Include for meta-analysis", "Exclude after full-text"]
         cur_ft = st.session_state["ft_decisions"].get(rid, "Not reviewed yet")
@@ -1455,37 +1183,32 @@ for _, row in view_df.iterrows():
         new_ft = st.radio("", ft_opts, index=ft_opts.index(cur_ft), key=f"ft_{rid}")
         st.session_state["ft_decisions"][rid] = new_ft
 
-        ft_reason = st.text_area("Full-text reason / notes",
-                                 value=st.session_state["ft_reasons"].get(rid,""),
-                                 key=f"ft_reason_{rid}", height=80)
+        ft_reason = st.text_area("Full-text reason / notes", value=st.session_state["ft_reasons"].get(rid,""), key=f"ft_reason_{rid}", height=80)
         st.session_state["ft_reasons"][rid] = ft_reason
 
-        ft_note = st.text_input("若查不到全文：填原因/狀態（付費牆、館際、等待作者回信…）",
-                                value=st.session_state["ft_note"].get(rid,""),
-                                key=f"ft_note_{rid}")
+        ft_note = st.text_input("若查不到全文：填原因/狀態（付費牆、館際、等待作者回信…）", value=st.session_state["ft_note"].get(rid,""), key=f"ft_note_{rid}")
         st.session_state["ft_note"][rid] = ft_note
 
         st.markdown("#### 上傳 PDF（可選）")
         uploaded_pdf = st.file_uploader("PDF 上傳（每篇文章各自上傳）", type=["pdf"], key=f"pdf_{rid}")
         extracted = ""
-        if uploaded_pdf is not None:
-            if HAS_PYPDF2:
-                try:
-                    reader = PdfReader(uploaded_pdf)
-                    texts = []
-                    for page in reader.pages[:60]:
-                        t = page.extract_text() or ""
-                        if t.strip():
-                            texts.append(t)
-                    extracted = "\n".join(texts).strip()
-                    if not extracted:
-                        st.warning("PDF 可能是掃描圖檔或無文字層。建議先 OCR（Adobe/Drive OCR）再上傳，或貼 figure/table 相關段落。")
-                    else:
-                        st.success(f"已抽取文字（前 60 頁），長度={len(extracted)}。")
-                except Exception as e:
-                    st.error(f"PDF 讀取失敗：{e}")
-            else:
-                st.warning("環境無 PyPDF2，無法從 PDF 抽字。請改用貼全文。")
+        if uploaded_pdf is not None and HAS_PYPDF2:
+            try:
+                reader = PdfReader(uploaded_pdf)
+                texts = []
+                for page in reader.pages[:80]:
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        texts.append(t)
+                extracted = "\n".join(texts).strip()
+                if not extracted:
+                    st.warning("PDF 可能是掃描圖檔或無文字層。建議 OCR 後再上傳，或貼 figure/table 段落。")
+                else:
+                    st.success(f"已抽取文字（前 80 頁），長度={len(extracted)}。")
+            except Exception as e:
+                st.error(f"PDF 讀取失敗：{e}")
+        elif uploaded_pdf is not None and not HAS_PYPDF2:
+            st.warning("環境無 PyPDF2，無法從 PDF 抽字。請改用貼全文。")
 
         st.markdown("#### Full text / 關鍵段落（可貼全文、或貼 figure/table 相關段落）")
         default_text = st.session_state["ft_text"].get(rid,"")
@@ -1497,34 +1220,51 @@ for _, row in view_df.iterrows():
         st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================================================
-# [15] Step 4: PRISMA + exports
+# Step 4: Export screening summary (CSV) + PRISMA counts (basic)
 # =========================================================
-st.header("Step 4. PRISMA（AI 篩選）+ 匯出")
+st.header("Step 4. 匯出（screening summary / fulltext 任務）")
 
-summary_df = build_summary_df(df_records)
+def build_summary_df() -> pd.DataFrame:
+    rows = []
+    for _, r in df_records.iterrows():
+        rid = r["record_id"]
+        a = ai_ta_df[ai_ta_df["record_id"]==rid].head(1)
+        a = a.iloc[0].to_dict() if not a.empty else {}
+        openurl = build_openurl(st.session_state.get("RESOLVER_BASE",""), doi=r.get("doi",""), pmid=r.get("pmid",""), title=r.get("title",""))
+        openurl = apply_ezproxy(st.session_state.get("EZPROXY",""), openurl) if openurl else ""
+        rows.append({
+            "record_id": rid,
+            "pmid": r.get("pmid",""),
+            "doi": r.get("doi",""),
+            "year": r.get("year",""),
+            "first_author": r.get("first_author",""),
+            "title": r.get("title",""),
+            "source": r.get("source",""),
+            "institution_openurl": openurl,
+            "AI_label": a.get("AI_label",""),
+            "AI_confidence": a.get("AI_confidence",""),
+            "AI_reason": a.get("AI_reason",""),
+            "TA_final": st.session_state["ta_final"].get(rid, "Unsure"),
+            "FT_decision": st.session_state["ft_decisions"].get(rid, "Not reviewed yet"),
+            "FT_reason": st.session_state["ft_reasons"].get(rid, ""),
+            "FT_note": st.session_state["ft_note"].get(rid, ""),
+        })
+    return pd.DataFrame(rows)
 
-tab1, tab2, tab3 = st.tabs(["Unsure（待確認 full-text）", "AI Excluded（含理由）", "AI Included（進 full-text）"])
-with tab1:
-    dfu = summary_df[summary_df["TA_final_AI"]=="Unsure"].copy()
-    st.dataframe(dfu[["record_id","pmid","doi","year","first_author","title","AI_reason","institution_openurl"]], use_container_width=True)
-    st.download_button("下載 Unsure 清單（CSV）", data=to_csv_bytes(dfu), file_name="ta_unsure.csv", mime="text/csv")
-with tab2:
-    dfx = summary_df[summary_df["TA_final_AI"]=="Exclude"].copy()
-    st.dataframe(dfx[["record_id","pmid","doi","year","first_author","title","AI_reason","institution_openurl"]], use_container_width=True)
-    st.download_button("下載 Excluded 清單（CSV, 含理由）", data=to_csv_bytes(dfx), file_name="ta_excluded.csv", mime="text/csv")
-with tab3:
-    dfi = summary_df[summary_df["TA_final_AI"]=="Include"].copy()
-    st.dataframe(dfi[["record_id","pmid","doi","year","first_author","title","AI_reason","institution_openurl"]], use_container_width=True)
-    st.download_button("下載 Included(for FT) 清單（CSV）", data=to_csv_bytes(dfi), file_name="ta_included.csv", mime="text/csv")
+summary_df = build_summary_df()
+st.download_button("下載 screening summary（CSV）", data=to_csv_bytes(summary_df), file_name="screening_summary.csv", mime="text/csv")
 
-st.download_button("下載完整 screening summary（CSV）", data=to_csv_bytes(summary_df), file_name="screening_summary_all.csv", mime="text/csv")
+ft_queue = summary_df[summary_df["TA_final"].isin(["Include","Unsure"])].copy()
+st.caption("Full-text 任務隊列（建議：Include + Unsure 都進去拿全文）")
+st.dataframe(ft_queue[["record_id","title","TA_final","institution_openurl","FT_note"]], use_container_width=True)
+st.download_button("下載 fulltext 任務隊列（CSV）", data=to_csv_bytes(ft_queue), file_name="fulltext_queue.csv", mime="text/csv")
 
 # =========================================================
-# [17] Step 5: Extraction wide sheet + optional AI extraction
+# Step 5: Extraction wide table + optional AI extraction (LLM)
 # =========================================================
 st.header("Step 5. Data extraction（寬表；欄位不寫死）")
 
-base_frame = summary_df[["record_id","pmid","doi","title","institution_openurl","FT_note_cannot_obtain"]].copy()
+base_frame = summary_df[["record_id","pmid","doi","title","institution_openurl","FT_note"]].copy()
 for c in schema["base_cols"]:
     if c not in base_frame.columns:
         base_frame[c] = ""
@@ -1537,41 +1277,26 @@ for c in ["Effect_measure","Effect","Lower_CI","Upper_CI","Timepoint","Unit"]:
 
 existing = st.session_state.get("extract_wide_df", pd.DataFrame())
 if isinstance(existing, pd.DataFrame) and not existing.empty and "record_id" in existing.columns:
-    keep_cols = [c for c in existing.columns if c in base_frame.columns] + [c for c in base_frame.columns if c not in existing.columns]
-    existing = existing.reindex(columns=keep_cols)
-    base_frame = base_frame.merge(existing.drop_duplicates(subset=["record_id"]), on="record_id", how="left", suffixes=("","_old"))
-    for c in list(base_frame.columns):
-        if c.endswith("_old"):
-            orig = c[:-4]
-            base_frame[orig] = base_frame[orig].astype(str)
-            base_frame[c] = base_frame[c].astype(str)
-            base_frame[orig] = base_frame.apply(lambda r: r[c] if (r[c].strip() != "" and r[c] != "nan") else r[orig], axis=1)
-            base_frame = base_frame.drop(columns=[c])
+    # merge by record_id, keep old edits
+    merged = base_frame.merge(existing, on="record_id", how="left", suffixes=("","_old"))
+    for c in base_frame.columns:
+        oc = c + "_old"
+        if oc in merged.columns:
+            merged[c] = merged.apply(lambda r: r[oc] if (str(r[oc]).strip() not in ["", "nan", "None"]) else r[c], axis=1)
+            merged.drop(columns=[oc], inplace=True)
+    base_frame = merged
 
 edited = st.data_editor(
     base_frame,
     use_container_width=True,
     num_rows="dynamic",
     hide_index=True,
-    column_config={
-        "record_id": st.column_config.TextColumn("record_id", disabled=True),
-        "pmid": st.column_config.TextColumn("PMID", disabled=True),
-        "doi": st.column_config.TextColumn("DOI", disabled=True),
-        "title": st.column_config.TextColumn("Title", disabled=True, width="large"),
-        "institution_openurl": st.column_config.LinkColumn("全文(openurl)", display_text="open"),
-        "FT_note_cannot_obtain": st.column_config.TextColumn("Fulltext note"),
-        "Effect_measure": st.column_config.SelectboxColumn("Effect measure", options=["","OR","RR","HR","MD","SMD","Risk difference","Other"]),
-        "Effect": st.column_config.NumberColumn("Effect", required=False, format="%.4f"),
-        "Lower_CI": st.column_config.NumberColumn("Lower 95% CI", required=False, format="%.4f"),
-        "Upper_CI": st.column_config.NumberColumn("Upper 95% CI", required=False, format="%.4f"),
-    }
+    column_config={"institution_openurl": st.column_config.LinkColumn("全文(openurl)", display_text="open")}
 )
 st.session_state["extract_wide_df"] = edited
 st.download_button("下載 extraction 寬表（CSV）", data=to_csv_bytes(edited), file_name="extraction_wide.csv", mime="text/csv")
 
-st.markdown("---")
 st.subheader("5B.（可選）AI extraction（含 OCR/figure/table 提示；抽不到留空）")
-
 if llm_available():
     n_ai = st.number_input("每次 AI 抽取筆數", min_value=1, max_value=30, value=5, step=1)
     if st.button("執行 AI extraction（對前 N 筆已有全文者）"):
@@ -1579,23 +1304,21 @@ if llm_available():
             text_map = st.session_state["ft_text"]
             targets = []
             for rid in edited["record_id"].tolist():
-                t = (text_map.get(rid) or "").strip()
-                if t:
+                if (text_map.get(rid) or "").strip():
                     targets.append(rid)
                 if len(targets) >= int(n_ai):
                     break
-
             if not targets:
                 st.warning("沒有找到已貼/已抽取全文的研究。")
             else:
-                prompt_template = build_extraction_prompt(schema, pico, st.session_state.get("criteria_text",""))
+                prompt_template = build_extraction_prompt(schema, pico_now, st.session_state.get("criteria_text",""), goal_mode)
                 for rid in targets:
                     fulltext = (text_map.get(rid) or "").strip()
                     messages = [
                         {"role":"system","content":"You are an SR/MA full-text reviewer and extractor. Output ONLY valid JSON."},
                         {"role":"user","content":prompt_template + "\n\n[Full text]\n" + fulltext[:120000]}
                     ]
-                    txt = llm_chat(messages, temperature=0.1, timeout=120)
+                    txt = llm_chat(messages, temperature=0.1, timeout=150)
                     js = json_from_text(txt or "")
                     if not js:
                         continue
@@ -1630,82 +1353,10 @@ if llm_available():
 else:
     st.info("未設定 LLM：可先用寬表手動抽取。")
 
-st.markdown("---")
-st.subheader("5C. Forest plot（fixed effect；使用寬表 Effect/CI）")
-
-if not HAS_MPL:
-    st.info("環境缺少 matplotlib，跳過森林圖。")
-else:
-    df_fx = st.session_state.get("extract_wide_df", pd.DataFrame()).copy()
-    if df_fx.empty:
-        st.info("尚無 extraction 寬表。")
-    else:
-        measure = st.selectbox("Effect measure", options=["OR","RR","HR","MD","SMD","Risk difference"], index=0)
-        sub = df_fx[df_fx["Effect_measure"].astype(str)==measure].copy()
-        sub = sub.dropna(subset=["Effect","Lower_CI","Upper_CI"], how="any")
-        if sub.empty:
-            st.info("沒有可用的 effect/CI（請先在寬表填 Effect/CI 與 measure）。")
-        else:
-            try:
-                eff = sub["Effect"].astype(float).tolist()
-                lcl = sub["Lower_CI"].astype(float).tolist()
-                ucl = sub["Upper_CI"].astype(float).tolist()
-
-                if measure in ["OR","RR","HR"]:
-                    log_eff = [math.log(x) for x in eff]
-                    log_lcl = [math.log(x) for x in lcl]
-                    log_ucl = [math.log(x) for x in ucl]
-                    se = [(hi - lo) / (2*1.96) for lo, hi in zip(log_lcl, log_ucl)]
-                    w = [1/(s*s) if s and s>0 else 0 for s in se]
-                    sw = sum(w)
-                    pooled_log = sum(wi*xi for wi,xi in zip(w,log_eff))/sw
-                    se_pool = math.sqrt(1/sw)
-                    pooled = math.exp(pooled_log)
-                    pooled_l = math.exp(pooled_log - 1.96*se_pool)
-                    pooled_u = math.exp(pooled_log + 1.96*se_pool)
-                    null = 1.0
-                else:
-                    se = [(hi - lo) / (2*1.96) for lo, hi in zip(lcl, ucl)]
-                    w = [1/(s*s) if s and s>0 else 0 for s in se]
-                    sw = sum(w)
-                    pooled = sum(wi*xi for wi,xi in zip(w,eff))/sw
-                    se_pool = math.sqrt(1/sw)
-                    pooled_l = pooled - 1.96*se_pool
-                    pooled_u = pooled + 1.96*se_pool
-                    null = 0.0
-
-                st.write(f"Fixed-effect pooled {measure} = **{pooled:.4f}** (95% CI {pooled_l:.4f}–{pooled_u:.4f})")
-
-                labels = []
-                for _, r in sub.iterrows():
-                    lab = f"{r.get('First author','') or r.get('first_author','')} {r.get('Year','') or r.get('year','')}".strip()
-                    labels.append(short(lab or r.get("record_id",""), 40))
-
-                y = list(range(len(sub), 0, -1))
-                fig_h = max(3.5, 0.35*len(sub) + 2.0)
-                fig, ax = plt.subplots(figsize=(8, fig_h))
-                ax.errorbar(
-                    eff, y,
-                    xerr=[[e-l for e,l in zip(eff,lcl)], [u-e for u,e in zip(ucl,eff)]],
-                    fmt='o', capsize=3
-                )
-                ax.axvline(null, linestyle='--', linewidth=1)
-                ax.axvline(pooled, linestyle='-', linewidth=1)
-                ax.set_yticks(y)
-                ax.set_yticklabels(labels)
-                ax.set_xlabel(f"Effect ({measure})")
-                ax.set_title(f"Forest plot (fixed effect) - {measure}")
-                ax.set_ylim(0, len(sub)+1)
-                st.pyplot(fig)
-
-            except Exception as e:
-                st.error(f"森林圖計算失敗：{e}")
-
 # =========================================================
 # Step 6: ROB 2.0 (manual)
 # =========================================================
 st.header("Step 6. ROB 2.0（手動下拉）")
-st.caption("ROB 2.0 需要標準化評分；這裡提供五大 domain + overall 的下拉。")
 
 rob_candidates = summary_df[(summary_df["FT_decision"]=="Include for meta-analysis")].copy()
 if rob_candidates.empty:
