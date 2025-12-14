@@ -1,5 +1,6 @@
 streamlit
-requests
 pandas
-openai
-google-generativeai
+requests
+PyPDF2
+matplotlib
+python-docx
